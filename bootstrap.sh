@@ -12,11 +12,8 @@ if [ ! -d "$DIR/extension-ci-tools" ]; then
         "$DIR/extension-ci-tools"
 fi
 
-# LuaJIT (self-contained Lua runtime)
-if [ ! -d "$DIR/third_party/LuaJIT" ]; then
-    echo "Cloning LuaJIT..."
-    git clone --depth 1 https://github.com/LuaJIT/LuaJIT.git \
-        "$DIR/third_party/LuaJIT"
-fi
+# LuaJIT — git submodule, init if needed
+echo "Initializing submodules..."
+git submodule update --init
 
 echo "=== Done. Run: make configure && make release ==="
