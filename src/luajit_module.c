@@ -665,6 +665,86 @@ static void mod_init(duckdb_init_info info) {
         return;
     }
 
+    /* ── save mode: persist UDFs to file ── */
+    if(!strcmp(m,"save")){
+        const char *path = d->source ? d->source : "luajit_udfs.txt";
+        L_();lua_State *L=g_lua;
+        if(!L){d->msg=strdup("no Lua");return;}
+
+        FILE *fp=fopen(path,"w");
+        if(!fp){d->msg=strdup("file write failed");return;}
+
+        /* Iterate globals, write name\\tsource per line */
+        lua_getglobal(L,"_G");lua_pushnil(L);
+        int n_saved=0;
+        while(lua_next(L,-2)){
+            if(lua_isfunction(L,-1)&&lua_type(L,-2)==LUA_TSTRING){
+                const char *k=lua_tostring(L,-2);
+                if(k[0]!='_'
+                   &&strcmp(k,"assert")&&strcmp(k,"collectgarbage")&&strcmp(k,"dofile")
+                   &&strcmp(k,"error")&&strcmp(k,"getfenv")
+                   &&strcmp(k,"getmetatable")&&strcmp(k,"ipairs")&&strcmp(k,"load")
+                   &&strcmp(k,"loadfile")&&strcmp(k,"loadstring")&&strcmp(k,"module")
+                   &&strcmp(k,"newproxy")&&strcmp(k,"next")&&strcmp(k,"pairs")
+                   &&strcmp(k,"pcall")&&strcmp(k,"print")&&strcmp(k,"rawequal")
+                   &&strcmp(k,"rawget")&&strcmp(k,"rawset")&&strcmp(k,"require")
+                   &&strcmp(k,"select")&&strcmp(k,"setfenv")&&strcmp(k,"setmetatable")
+                   &&strcmp(k,"tonumber")&&strcmp(k,"tostring")&&strcmp(k,"type")
+                   &&strcmp(k,"unpack")&&strcmp(k,"xpcall"))
+                {
+                    /* Get source from _UDF_SOURCES registry */
+                    const char *src="?";
+                    lua_getglobal(L,"_UDF_SOURCES");
+                    if(lua_istable(L,-1)){lua_getfield(L,-1,k);if(lua_isstring(L,-1))src=lua_tostring(L,-1);lua_pop(L,1);}
+                    lua_pop(L,1);
+                    fprintf(fp,"%s\t%s\n",k,src);
+                    n_saved++;
+                }
+            }
+            lua_pop(L,1);
+        }
+        lua_pop(L,1);
+        fclose(fp);
+
+        d->ok=true;d->phase="save";
+        char buf[256];snprintf(buf,sizeof(buf),"saved %d UDFs to %s",n_saved,path);
+        d->msg=strdup(buf);
+        return;
+    }
+
+    /* ── load mode: restore UDFs from file (name\\tsource per line) ── */
+    if(!strcmp(m,"load")){
+        const char *path = d->source ? d->source : "luajit_udfs.txt";
+        FILE *fp=fopen(path,"r");
+        if(!fp){d->msg=strdup("file not found");return;}
+
+        L_();lua_State *L=g_lua;
+        if(!L){fclose(fp);d->msg=strdup("no Lua");return;}
+
+        int loaded=0;
+        char line[16384];
+        while(fgets(line,sizeof(line),fp)){
+            char *tab=strchr(line,'\t');
+            if(!tab)continue;*tab=0;
+            char *name=line,*source=tab+1;
+            /* trim trailing newline */
+            size_t sl=strlen(source);
+            while(sl>0&&(source[sl-1]=='\n'||source[sl-1]=='\r'))source[--sl]=0;
+
+            if(strlen(source)==0||!strcmp(source,"?"))continue;
+            if(luaL_loadstring(L,source)!=LUA_OK){lua_pop(L,1);continue;}
+            if(lua_pcall(L,0,1,0)!=LUA_OK){lua_pop(L,1);continue;}
+            if(!lua_isfunction(L,-1)){lua_pop(L,1);continue;}
+            lua_setglobal(L,name);loaded++;
+        }
+        fclose(fp);
+
+        d->ok=true;d->phase="load";
+        char mbuf[128];snprintf(mbuf,sizeof(mbuf),"loaded %d UDFs from %s",loaded,path);
+        d->msg=strdup(mbuf);
+        return;
+    }
+
     /* ── macro mode ── */
     if(!strcmp(m,"macro")){
         if(!d->sql_name){d->msg=strdup("need sql_name for macro");return;}
@@ -730,6 +810,12 @@ static void mod_init(duckdb_init_info info) {
             lua_pop(L,1);
         }else{lua_pop(L,1);}
         /* Step 4: store as Lua global */
+        /* Step 6: save source for persistence */
+        lua_getglobal(L,"_UDF_SOURCES");
+        if(!lua_istable(L,-1)){lua_pop(L,1);lua_newtable(L);lua_setglobal(L,"_UDF_SOURCES");lua_getglobal(L,"_UDF_SOURCES");}
+        lua_pushstring(L,d->source);lua_setfield(L,-2,d->sql_name);
+        lua_pop(L,1);
+
         lua_setglobal(L,d->sql_name);
         /* Step 5: generate macro DDL */
         const char *fn=*var=='i'?"luajit_i":*var=='f'?"luajit_f":*var=='b'?"luajit_b":"luajit";
@@ -757,6 +843,10 @@ static void mod_init(duckdb_init_info info) {
     if(!lua_isfunction(L,-1))
         {d->msg=strdup("must return a function");lua_pop(L,1);return;}
     lua_setglobal(L,d->sql_name);
+    /* save source for persistence */
+    lua_getglobal(L,"_UDF_SOURCES");
+    if(!lua_istable(L,-1)){lua_pop(L,1);lua_newtable(L);lua_setglobal(L,"_UDF_SOURCES");lua_getglobal(L,"_UDF_SOURCES");}
+    lua_pushstring(L,d->source);lua_setfield(L,-2,d->sql_name);lua_pop(L,1);
     d->ok=true;d->sql_name=strdup(d->sql_name);
 }
 
