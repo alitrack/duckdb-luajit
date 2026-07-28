@@ -271,6 +271,129 @@ static void fjl(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     }
 }
 
+/* ── STRUCT bridge: DuckDB STRUCT ↔ Lua table (named keys) ── */
+
+static void push_struct_to_lua(lua_State *L, duckdb_vector sv, idx_t r) {
+    duckdb_logical_type st = duckdb_vector_get_column_type(sv);
+    idx_t nc = duckdb_struct_type_child_count(st);
+    lua_createtable(L, 0, (int)nc);
+    for (idx_t i = 0; i < nc; i++) {
+        char *name = duckdb_struct_type_child_name(st, i);
+        duckdb_vector child = duckdb_struct_vector_get_child(sv, i);
+        duckdb_type ct = duckdb_get_type_id(duckdb_struct_type_child_type(st, i));
+        if (ct == DUCKDB_TYPE_BIGINT || ct == DUCKDB_TYPE_INTEGER || ct == DUCKDB_TYPE_SMALLINT)
+            { lua_pushinteger(L, ((int64_t*)duckdb_vector_get_data(child))[r]);
+              lua_setfield(L, -2, name); }
+        else if (ct == DUCKDB_TYPE_DOUBLE || ct == DUCKDB_TYPE_FLOAT)
+            { lua_pushnumber(L, ((double*)duckdb_vector_get_data(child))[r]);
+              lua_setfield(L, -2, name); }
+        else if (ct == DUCKDB_TYPE_VARCHAR) {
+            duckdb_string_t s = ((duckdb_string_t*)duckdb_vector_get_data(child))[r];
+            lua_pushlstring(L, duckdb_string_t_data(&s), duckdb_string_t_length(s));
+            lua_setfield(L, -2, name);
+        } else if (ct == DUCKDB_TYPE_BOOLEAN)
+            { lua_pushboolean(L, ((bool*)duckdb_vector_get_data(child))[r]);
+              lua_setfield(L, -2, name); }
+        duckdb_free(name);
+    }
+}
+
+static void write_lua_to_struct(lua_State *L, duckdb_vector out, idx_t row) {
+    duckdb_logical_type st = duckdb_vector_get_column_type(out);
+    idx_t nc = duckdb_struct_type_child_count(st);
+    lua_pushnil(L);
+    while (lua_next(L, -2)) {
+        const char *key = lua_tostring(L, -2);
+        if (!key) { lua_pop(L, 1); continue; }
+        for (idx_t i = 0; i < nc; i++) {
+            char *name = duckdb_struct_type_child_name(st, i);
+            if (!strcmp(key, name)) {
+                duckdb_vector child = duckdb_struct_vector_get_child(out, i);
+                duckdb_type ct = duckdb_get_type_id(duckdb_struct_type_child_type(st, i));
+                if (ct == DUCKDB_TYPE_BIGINT || ct == DUCKDB_TYPE_INTEGER)
+                    ((int64_t*)duckdb_vector_get_data(child))[row] =
+                        lua_isnumber(L, -1) ? (int64_t)lua_tointeger(L, -1) : 0;
+                else if (ct == DUCKDB_TYPE_DOUBLE)
+                    ((double*)duckdb_vector_get_data(child))[row] =
+                        lua_isnumber(L, -1) ? lua_tonumber(L, -1) : 0.0;
+                else if (ct == DUCKDB_TYPE_VARCHAR)
+                    duckdb_vector_assign_string_element(child, row,
+                        lua_isstring(L, -1) ? lua_tostring(L, -1) : "");
+                else if (ct == DUCKDB_TYPE_BOOLEAN)
+                    ((bool*)duckdb_vector_get_data(child))[row] =
+                        lua_toboolean(L, -1) ? true : false;
+                duckdb_free(name);
+                break;
+            }
+            duckdb_free(name);
+        }
+        lua_pop(L, 1);
+    }
+}
+
+static void fjs(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
+    L_(); lua_State *L = g_lua; if (!L) return;
+    idx_t nr = duckdb_data_chunk_get_size(in);
+    for (idx_t r = 0; r < nr; r++) {
+        if (!resolve_udf(L, duckdb_data_chunk_get_vector(in, 0), r))
+            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); continue; }
+        push_struct_to_lua(L, duckdb_data_chunk_get_vector(in, 1), r);
+        if (lua_pcall(L, 1, 1, 0) != LUA_OK)
+            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); lua_pop(L, 1); continue; }
+        if (!lua_istable(L, -1))
+            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); lua_pop(L, 1); continue; }
+        write_lua_to_struct(L, out, r);
+        lua_pop(L, 1);
+    }
+}
+
+/* ── MAP bridge: DuckDB MAP ↔ Lua table (key→value) ── */
+
+static void push_map_to_lua(lua_State *L, duckdb_vector mv, idx_t r) {
+    list_entry_t *entries = (list_entry_t *)duckdb_vector_get_data(mv);
+    uint64_t off = entries[r].offset, len = entries[r].length;
+    duckdb_vector child = duckdb_list_vector_get_child(mv); /* STRUCT(key,value) */
+    duckdb_vector key_vec = duckdb_struct_vector_get_child(child, 0);
+    duckdb_vector val_vec = duckdb_struct_vector_get_child(child, 1);
+    duckdb_type kt = duckdb_get_type_id(duckdb_vector_get_column_type(key_vec));
+    duckdb_type vt = duckdb_get_type_id(duckdb_vector_get_column_type(val_vec));
+    lua_createtable(L, 0, (int)len);
+    for (uint64_t i = 0; i < len; i++) {
+        /* push key */
+        if (kt == DUCKDB_TYPE_BIGINT || kt == DUCKDB_TYPE_INTEGER)
+            lua_pushinteger(L, ((int64_t*)duckdb_vector_get_data(key_vec))[off + i]);
+        else if (kt == DUCKDB_TYPE_VARCHAR) {
+            duckdb_string_t s = ((duckdb_string_t*)duckdb_vector_get_data(key_vec))[off + i];
+            lua_pushlstring(L, duckdb_string_t_data(&s), duckdb_string_t_length(s));
+        } else continue;
+        /* push value */
+        if (vt == DUCKDB_TYPE_DOUBLE || vt == DUCKDB_TYPE_FLOAT)
+            lua_pushnumber(L, ((double*)duckdb_vector_get_data(val_vec))[off + i]);
+        else if (vt == DUCKDB_TYPE_BIGINT || vt == DUCKDB_TYPE_INTEGER)
+            lua_pushinteger(L, ((int64_t*)duckdb_vector_get_data(val_vec))[off + i]);
+        else if (vt == DUCKDB_TYPE_VARCHAR) {
+            duckdb_string_t s = ((duckdb_string_t*)duckdb_vector_get_data(val_vec))[off + i];
+            lua_pushlstring(L, duckdb_string_t_data(&s), duckdb_string_t_length(s));
+        } else { lua_pop(L, 1); continue; }
+        lua_rawset(L, -3);
+    }
+}
+
+static void fjm_map(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
+    L_(); lua_State *L = g_lua; if (!L) return;
+    idx_t nr = duckdb_data_chunk_get_size(in);
+    for (idx_t r = 0; r < nr; r++) {
+        if (!resolve_udf(L, duckdb_data_chunk_get_vector(in, 0), r))
+            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); continue; }
+        push_map_to_lua(L, duckdb_data_chunk_get_vector(in, 1), r);
+        if (lua_pcall(L, 1, 1, 0) != LUA_OK)
+            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); lua_pop(L, 1); continue; }
+        to_str(L);
+        duckdb_vector_assign_string_element(out, r, lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+}
+
 /* ── luajit_module() table function ── */
 
 typedef struct {
@@ -540,6 +663,8 @@ void luajit_register_module_functions(
       duckdb_destroy_logical_type(&at);
       duckdb_register_scalar_function(conn, f);
       duckdb_destroy_scalar_function(&f); }
+    /* TODO: luajit_s / luajit_map — struct/map bridge code ready, pending
+     * DuckDB C API support for generic struct/map parameter types. */
     #undef REG
     #undef VARGS
     #undef END
