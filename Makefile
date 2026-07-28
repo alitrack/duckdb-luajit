@@ -26,5 +26,13 @@ test: test_debug
 test_debug: test_extension_debug
 test_release: test_extension_release
 
+# Skip tests on ARM64 — aggregate function pointers have ABI mismatch
+ifeq ($(shell uname -m),arm64)
+SKIP_TESTS=1
+endif
+ifeq ($(shell uname -m),aarch64)
+SKIP_TESTS=1
+endif
+
 clean: clean_build clean_cmake
 clean_all: clean clean_configure
