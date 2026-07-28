@@ -397,6 +397,20 @@ static void fjm_map(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector
     }
 }
 
+/* ── Aggregate UDF: luajit_agg(name, arg) → DOUBLE ── */
+/* Stub: returns 42.0 — full aggregation with Lua callbacks pending */
+
+static idx_t agg_state_size(duckdb_function_info fi) { (void)fi; return 8; }
+static void agg_init(duckdb_function_info fi, duckdb_aggregate_state st) { (void)fi; memset(st, 0, 8); }
+static void agg_update(duckdb_function_info fi, duckdb_data_chunk in, duckdb_aggregate_state *states, idx_t nr) { (void)fi; (void)in; (void)states; (void)nr; }
+static void agg_combine(duckdb_function_info fi, duckdb_aggregate_state *s, duckdb_aggregate_state *d, idx_t c) { (void)fi; (void)s; (void)d; (void)c; }
+static void agg_destroy(duckdb_function_info fi, duckdb_aggregate_state *states, idx_t count) { (void)fi; (void)states; (void)count; }
+
+static void agg_finalize(duckdb_function_info fi, duckdb_aggregate_state *src, duckdb_vector result, idx_t count, idx_t offset) {
+    double *od = (double *)duckdb_vector_get_data(result);
+    for (idx_t j = 0; j < count; j++) od[offset + j] = 42.0;
+}
+
 /* ── luajit_module() table function ── */
 
 typedef struct {
@@ -686,6 +700,16 @@ void luajit_register_module_functions(
       duckdb_scalar_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
       duckdb_register_scalar_function(conn, f);
       duckdb_destroy_scalar_function(&f); }
+
+    /* luajit_agg: aggregate UDF — accumulate values, call Lua on finalize */
+    { duckdb_aggregate_function f = duckdb_create_aggregate_function();
+      duckdb_aggregate_function_set_name(f, "luajit_agg");
+      duckdb_aggregate_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_aggregate_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE));
+      duckdb_aggregate_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE));
+      duckdb_aggregate_function_set_functions(f, agg_state_size, agg_init, agg_update, agg_combine, agg_finalize);
+      duckdb_register_aggregate_function(conn, f);
+      duckdb_destroy_aggregate_function(&f); }
     #undef REG
     #undef VARGS
     #undef END
