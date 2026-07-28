@@ -32,9 +32,17 @@ if(NOT DUCKDB_WASM_EXTENSION)
     set(LUAJIT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/LuaJIT)
     set(LUAJIT_LIB ${LUAJIT_DIR}/src/libluajit.a)
 
+    if(APPLE)
+        set(NPROC_CMD sysctl -n hw.logicalcpu)
+        set(LUAJIT_MAKE_ENV MACOSX_DEPLOYMENT_TARGET=14.0)
+    else()
+        set(NPROC_CMD nproc)
+        set(LUAJIT_MAKE_ENV "")
+    endif()
+
     add_custom_command(
         OUTPUT ${LUAJIT_LIB}
-        COMMAND make -C ${LUAJIT_DIR} -j$$(nproc) BUILDMODE=static XCFLAGS=-fPIC
+        COMMAND ${CMAKE_COMMAND} -E env ${LUAJIT_MAKE_ENV} make -C ${LUAJIT_DIR} -j$$(${NPROC_CMD}) BUILDMODE=static XCFLAGS=-fPIC
         COMMENT "Building LuaJIT..."
         WORKING_DIRECTORY ${LUAJIT_DIR}
     )
