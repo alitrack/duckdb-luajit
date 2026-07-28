@@ -70,7 +70,7 @@ SELECT luajit('return _duckdb_call("CREATE TABLE log(ts TIMESTAMP DEFAULT NOW())
 - **Chunk processing**: row-level Lua calls inside DuckDB data chunks
 - **Session management**: list/drop/reset + inspect/probe/auto-macro
 - **Nested types**: LIST/STRUCT/MAP bridge via DUCKDB_TYPE_ANY
-- **Benchmark**: 50K rows = 1.9x native SQL
+- **Benchmark**: 50K rows: luajit_i = 0.011s, native = 0.006s (ratio 1.9x slower)
 
 ## Build
 
