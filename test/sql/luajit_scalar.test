@@ -1,0 +1,27 @@
+# name: luajit inline eval
+# description: Test luajit() scalar function
+# group: [luajit]
+
+# arithmetic
+query T
+SELECT luajit('return 1 + 2')
+----
+3
+
+# string
+query T
+SELECT luajit('return "hello"')
+----
+hello
+
+# Lua version
+query T
+SELECT luajit('return _VERSION')
+----
+Lua 5.1
+
+# nil returns NULL
+query T
+SELECT luajit('return nil')
+----
+NULL
