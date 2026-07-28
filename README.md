@@ -1,4 +1,4 @@
-# luajit — DuckDB LuaJIT UDF Extension  v0.5
+# luajit — DuckDB LuaJIT UDF Extension  v0.6
 
 Self-contained DuckDB extension for Lua expressions and JIT-compiled UDFs via LuaJIT.
 
@@ -41,10 +41,26 @@ SELECT luajit_m('add', 3, 4::DOUBLE);         -- 7.0 (mixed, auto-cast)
 |------|-------------|
 | `info` | Extension version info |
 | `compile` | Compile Lua source, store as global |
+| `quick_compile` | One-shot compile + auto-probe return type + auto-MACRO |
+| `inspect` | Show function arity, return type, source |
 | `macro` | Generate `CREATE MACRO` DDL |
 | `list` | List all compiled UDFs |
 | `drop` | Remove a UDF by name |
 | `reset` | Clear all UDFs (fresh Lua state) |
+
+```sql
+-- One-shot: compile + auto-type + auto-macro
+SELECT detail FROM luajit_module(
+    mode := 'quick_compile',
+    source := 'return function(a, b) return a + b end',
+    sql_name := 'add'
+);
+--> CREATE OR REPLACE MACRO add(x1, x2) AS luajit_i('add', x1, x2)
+
+-- Inspect function: arity, return type, source
+SELECT detail FROM luajit_module(mode := 'inspect', sql_name := 'add');
+--> add(2 args) → BIGINT (source: return function(a,b) return a+b end)
+```
 
 ```sql
 -- List
