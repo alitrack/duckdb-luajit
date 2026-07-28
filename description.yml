@@ -1,6 +1,6 @@
 name: luajit
-version: 0.15.0
-description: "LuaJIT UDFs — 9 scalar, 1 agg (GROUP BY), 1 table, save/load/auto-load, bench: ~1400x vs Python UDF"
+version: 0.16.0
+description: "LuaJIT UDFs — 10 scalar (incl. batch @1.0x native), 1 agg, 1 table, save/load/auto-load"
 license: MIT
 maintainers:
   - alitrack
