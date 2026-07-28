@@ -1,6 +1,6 @@
 name: luajit
-version: 0.13.0
-description: LuaJIT UDFs for DuckDB — 9 scalar, 1 aggregate (GROUP BY), 1 table, 8 modes, ~700KB.
+version: 0.14.0
+description: LuaJIT UDFs — 9 scalar, 1 agg (GROUP BY), 1 table, save/load, 10 modes, ~700KB.
 license: MIT
 maintainers:
   - alitrack
