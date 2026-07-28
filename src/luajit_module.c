@@ -339,10 +339,9 @@ static void fjs(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
             { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); continue; }
         push_struct_to_lua(L, duckdb_data_chunk_get_vector(in, 1), r);
         if (lua_pcall(L, 1, 1, 0) != LUA_OK)
-            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); lua_pop(L, 1); continue; }
-        if (!lua_istable(L, -1))
-            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); lua_pop(L, 1); continue; }
-        write_lua_to_struct(L, out, r);
+            { duckdb_vector_assign_string_element(out, r, lua_tostring(L, -1)); lua_pop(L, 1); continue; }
+        to_str(L);
+        duckdb_vector_assign_string_element(out, r, lua_tostring(L, -1));
         lua_pop(L, 1);
     }
 }
@@ -663,8 +662,26 @@ void luajit_register_module_functions(
       duckdb_destroy_logical_type(&at);
       duckdb_register_scalar_function(conn, f);
       duckdb_destroy_scalar_function(&f); }
-    /* TODO: luajit_s / luajit_map — struct/map bridge code ready, pending
-     * DuckDB C API support for generic struct/map parameter types. */
+
+    /* luajit_s: STRUCT → VARCHAR bridge (ANY param for generic struct) */
+    { duckdb_scalar_function f = duckdb_create_scalar_function();
+      duckdb_scalar_function_set_name(f, "luajit_s");
+      duckdb_scalar_function_set_function(f, fjs);
+      duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_ANY));
+      duckdb_scalar_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_register_scalar_function(conn, f);
+      duckdb_destroy_scalar_function(&f); }
+
+    /* luajit_map: MAP(ANY,ANY) → VARCHAR bridge */
+    { duckdb_scalar_function f = duckdb_create_scalar_function();
+      duckdb_scalar_function_set_name(f, "luajit_map");
+      duckdb_scalar_function_set_function(f, fjm_map);
+      duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_ANY));
+      duckdb_scalar_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_register_scalar_function(conn, f);
+      duckdb_destroy_scalar_function(&f); }
     #undef REG
     #undef VARGS
     #undef END
