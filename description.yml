@@ -1,6 +1,6 @@
 name: luajit
-version: 0.9.0
-description: In-process JIT-compiled Lua UDFs via LuaJIT — luajit/i/f/b/m/l/s/map/agg, quick_compile, inspect, list/drop/reset, MACRO, STRUCT/LIST/MAP bridge, DuckDB callback. ~700KB, cross-platform.
+version: 0.10.0
+description: In-process JIT-compiled Lua UDFs via LuaJIT — 9 scalar, 1 aggregate, 1 table, 8 module modes, LIST/STRUCT/MAP bridge, ~700KB.
 license: MIT
 maintainers:
   - alitrack

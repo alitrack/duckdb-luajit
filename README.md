@@ -1,4 +1,4 @@
-# luajit — DuckDB LuaJIT UDF Extension  v0.9
+# luajit — DuckDB LuaJIT UDF Extension  v0.10
 
 Self-contained DuckDB extension for Lua expressions, JIT-compiled UDFs, and nested type bridges via LuaJIT.
 
@@ -34,6 +34,26 @@ SELECT luajit_l('lsum', [1,2,3]);               -- [6.0] (LIST)
 SELECT luajit_s('fmt', {x:3, y:4});             -- 'x=3 y=4 sum=7' (STRUCT)
 SELECT luajit_map('fmt_map', map {'a':1});      -- 'a=1' (MAP)
 ```
+
+## Table Function
+
+```sql
+-- Returns rows from a Lua table
+SELECT * FROM luajit_table('gen3');
+-- (1, 'a'), (2, 'b'), (3, 'c')
+
+-- Inline source (returns a function → call → table)
+SELECT * FROM luajit_table(
+    'return function() return {1, 2, 3} end'
+);
+
+-- Dynamic generation
+SELECT * FROM luajit_table(
+    'return function() local t={};for i=1,10 do t[i]=i*i end;return t end'
+);
+```
+
+Schema: `(row_idx BIGINT, val VARCHAR)`
 
 ## Module API (8 modes)
 
