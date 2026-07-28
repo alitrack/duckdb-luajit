@@ -1,4 +1,4 @@
-# luajit — DuckDB LuaJIT UDF Extension  v0.10
+# luajit — DuckDB LuaJIT UDF Extension  v0.11
 
 Self-contained DuckDB extension for Lua expressions, JIT-compiled UDFs, and nested type bridges via LuaJIT.
 
@@ -25,7 +25,7 @@ SELECT message FROM luajit_module(
 | `luajit_l` | VARCHAR + LIST... | LIST(DOUBLE) | Array operations |
 | `luajit_s` | VARCHAR + STRUCT | VARCHAR | Struct operations |
 | `luajit_map` | VARCHAR + MAP | VARCHAR | Key-value operations |
-| `luajit_agg` | VARCHAR + DOUBLE | DOUBLE | Aggregate (skeleton) |
+| `luajit_agg` | VARCHAR + DOUBLE | DOUBLE | Aggregate (Lua UDF on sum) |
 
 ```sql
 SELECT luajit_i('add', 3, 4);                    -- 7 (BIGINT)
@@ -51,6 +51,15 @@ SELECT * FROM luajit_table(
 SELECT * FROM luajit_table(
     'return function() local t={};for i=1,10 do t[i]=i*i end;return t end'
 );
+
+-- Lua UDF on aggregate — doubles the accumulated sum
+SELECT ok FROM luajit_module(
+    mode := 'compile',
+    source := 'return function(s) return s * 2 end',
+    sql_name := 'double_sum'
+);
+SELECT luajit_agg('double_sum', x) FROM (VALUES (1),(2),(3),(4),(5)) t(x);
+-- → 30.0 (sum=15, doubled)
 ```
 
 Schema: `(row_idx BIGINT, val VARCHAR)`
