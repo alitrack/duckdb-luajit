@@ -399,25 +399,38 @@ static void fjm_map(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector
 
 /* ── Aggregate UDF: luajit_agg(name, arg) → DOUBLE ── */
 
-static double *g_agg_vals = NULL;
-static idx_t g_agg_len = 0;
-static idx_t g_agg_cap = 0;
+#define AGG_MAX_GROUPS 256
+typedef struct {
+    uintptr_t key;       /* state pointer as group ID */
+    double  *vals; idx_t len, cap;
+} agg_group_t;
+
+static agg_group_t g_agg_groups[AGG_MAX_GROUPS];
+static int g_agg_n_groups = 0;
 static char *g_agg_udf = NULL;
+
+/* find or create group by state pointer key */
+static agg_group_t *agg_find_group(uintptr_t key) {
+    for (int i = 0; i < g_agg_n_groups; i++)
+        if (g_agg_groups[i].key == key) return &g_agg_groups[i];
+    if (g_agg_n_groups >= AGG_MAX_GROUPS) return NULL;
+    agg_group_t *g = &g_agg_groups[g_agg_n_groups++];
+    memset(g, 0, sizeof(*g)); g->key = key;
+    return g;
+}
 
 static idx_t agg_state_size(duckdb_function_info fi) { (void)fi; return 8; }
 static void agg_init(duckdb_function_info fi, duckdb_aggregate_state st) { (void)fi; memset(st, 0, 8); }
 
 static void agg_update(duckdb_function_info fi, duckdb_data_chunk in, duckdb_aggregate_state *states, idx_t nr) {
-    (void)fi; (void)states;
+    (void)fi; (void)nr;
 
-    /* Capture UDF name from column 0 */
     if (!g_agg_udf) {
         duckdb_vector nv = duckdb_data_chunk_get_vector(in, 0);
         duckdb_string_t ns = ((duckdb_string_t *)duckdb_vector_get_data(nv))[0];
         g_agg_udf = strdup(duckdb_string_t_data(&ns));
     }
 
-    /* Accumulate values — use chunk size, not nr (nr may be larger) */
     duckdb_vector cv = duckdb_data_chunk_get_vector(in, 1);
     double *cd = (double *)duckdb_vector_get_data(cv);
     uint64_t *validity = duckdb_vector_get_validity(cv);
@@ -425,11 +438,14 @@ static void agg_update(duckdb_function_info fi, duckdb_data_chunk in, duckdb_agg
 
     for (idx_t i = 0; i < chunk_nr; i++) {
         if (validity && !(validity[i / 64] & (1ULL << (i % 64)))) continue;
-        if (g_agg_len + 1 > g_agg_cap) {
-            g_agg_cap = g_agg_cap ? g_agg_cap * 2 : 1024;
-            g_agg_vals = (double *)realloc(g_agg_vals, g_agg_cap * sizeof(double));
+        uintptr_t key = (uintptr_t)states[i];
+        agg_group_t *g = agg_find_group(key);
+        if (!g) return; /* too many groups */
+        if (g->len + 1 > g->cap) {
+            g->cap = g->cap ? g->cap * 2 : 1024;
+            g->vals = (double *)realloc(g->vals, g->cap * sizeof(double));
         }
-        g_agg_vals[g_agg_len++] = cd[i];
+        g->vals[g->len++] = cd[i];
     }
 }
 static void agg_combine(duckdb_function_info fi, duckdb_aggregate_state *s, duckdb_aggregate_state *d, idx_t c) { (void)fi; (void)s; (void)d; (void)c; }
@@ -437,27 +453,36 @@ static void agg_destroy(duckdb_function_info fi, duckdb_aggregate_state *states,
 
 static void agg_finalize(duckdb_function_info fi, duckdb_aggregate_state *src, duckdb_vector result, idx_t count, idx_t offset) {
     double *od = (double *)duckdb_vector_get_data(result);
-    double *vals = g_agg_vals; idx_t len = g_agg_len; char *udf = g_agg_udf;
-    g_agg_vals = NULL; g_agg_len = g_agg_cap = 0; g_agg_udf = NULL;
+    int n_groups = g_agg_n_groups; char *udf = g_agg_udf;
+    g_agg_udf = NULL; g_agg_n_groups = 0;
 
     L_(); lua_State *L = g_lua;
-    if (!udf || !L) { od[offset] = 0.0; free(udf); return; }
+    if (!udf || !L) { free(udf); return; }
 
     lua_getglobal(L, udf);
-    if (!lua_isfunction(L, -1)) { lua_pop(L, 1); od[offset] = 0.0; free(udf); return; }
+    if (!lua_isfunction(L, -1)) { lua_pop(L, 1); free(udf); return; }
+    int udf_ref = luaL_ref(L, LUA_REGISTRYINDEX); /* keep UDF alive across calls */
 
-    /* Build Lua table {val[1], val[2], ...} */
-    lua_createtable(L, (int)len, 0);
-    for (idx_t i = 0; i < len; i++)
-        { lua_pushnumber(L, vals[i]); lua_rawseti(L, -2, (int)(i + 1)); }
+    for (int g_idx = 0; g_idx < n_groups && g_idx < (int)count; g_idx++) {
+        agg_group_t *g = &g_agg_groups[g_idx];
+        if (!g->vals || g->len == 0) { od[offset + g_idx] = 0.0; continue; }
 
-    if (lua_pcall(L, 1, 1, 0) == LUA_OK && lua_isnumber(L, -1))
-        od[offset] = lua_tonumber(L, -1);
-    else
-        { od[offset] = 0.0; lua_pop(L, 1); }
-    lua_pop(L, 1);
+        lua_rawgeti(L, LUA_REGISTRYINDEX, udf_ref);
+        lua_createtable(L, (int)g->len, 0);
+        for (idx_t i = 0; i < g->len; i++)
+            { lua_pushnumber(L, g->vals[i]); lua_rawseti(L, -2, (int)(i + 1)); }
 
-    free(vals);
+        if (lua_pcall(L, 1, 1, 0) == LUA_OK && lua_isnumber(L, -1))
+            od[offset + g_idx] = lua_tonumber(L, -1);
+        else
+            od[offset + g_idx] = 0.0;
+        lua_pop(L, 1);
+    }
+    luaL_unref(L, LUA_REGISTRYINDEX, udf_ref);
+
+    /* free all group arrays */
+    for (int g_idx = 0; g_idx < n_groups; g_idx++)
+        free(g_agg_groups[g_idx].vals);
     free(udf);
 }
 
