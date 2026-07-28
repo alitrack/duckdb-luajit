@@ -682,7 +682,7 @@ static void mod_init(duckdb_init_info info) {
                 const char *k=lua_tostring(L,-2);
                 if(k[0]!='_'
                    &&strcmp(k,"assert")&&strcmp(k,"collectgarbage")&&strcmp(k,"dofile")
-                   &&strcmp(k,"error")&&strcmp(k,"getfenv")
+                   &&strcmp(k,"error")&&strcmp(k,"gcinfo")&&strcmp(k,"getfenv")
                    &&strcmp(k,"getmetatable")&&strcmp(k,"ipairs")&&strcmp(k,"load")
                    &&strcmp(k,"loadfile")&&strcmp(k,"loadstring")&&strcmp(k,"module")
                    &&strcmp(k,"newproxy")&&strcmp(k,"next")&&strcmp(k,"pairs")
