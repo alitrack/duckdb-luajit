@@ -1,9 +1,12 @@
 # name: luajit v0.5 full API
 # description: Test all luajit functions
 
-# inline eval
-query T
-SELECT luajit('return 1 + 2')
+# inline eval — compile then call
+statement ok
+SELECT ok FROM luajit_module(mode:='quick_compile',source:='return function(x) return x + 2 end',sql_name:='add2')
+
+query I
+SELECT add2(1)
 ----
 3
 
