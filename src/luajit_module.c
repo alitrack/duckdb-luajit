@@ -205,6 +205,72 @@ static void fjm(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     }
 }
 
+/* ── LIST bridge ── */
+
+typedef struct { uint64_t offset; uint64_t length; } list_entry_t;
+
+static void push_list_to_lua(lua_State *L, duckdb_vector list_vec, duckdb_vector child_vec, idx_t r) {
+    list_entry_t *entries = (list_entry_t *)duckdb_vector_get_data(list_vec);
+    uint64_t off = entries[r].offset, len = entries[r].length;
+    duckdb_type ct = duckdb_get_type_id(duckdb_vector_get_column_type(child_vec));
+    lua_createtable(L, (int)len, 0);
+    if (ct == DUCKDB_TYPE_BIGINT || ct == DUCKDB_TYPE_INTEGER) {
+        int64_t *d = (int64_t *)duckdb_vector_get_data(child_vec);
+        for (uint64_t i = 0; i < len; i++)
+            { lua_pushinteger(L, (lua_Integer)d[off + i]); lua_rawseti(L, -2, (int)(i + 1)); }
+    } else if (ct == DUCKDB_TYPE_DOUBLE || ct == DUCKDB_TYPE_FLOAT) {
+        double *d = (double *)duckdb_vector_get_data(child_vec);
+        for (uint64_t i = 0; i < len; i++)
+            { lua_pushnumber(L, d[off + i]); lua_rawseti(L, -2, (int)(i + 1)); }
+    } else if (ct == DUCKDB_TYPE_VARCHAR) {
+        duckdb_string_t *d = (duckdb_string_t *)duckdb_vector_get_data(child_vec);
+        for (uint64_t i = 0; i < len; i++) {
+            duckdb_string_t s = d[off + i];
+            lua_pushlstring(L, duckdb_string_t_data(&s), duckdb_string_t_length(s));
+            lua_rawseti(L, -2, (int)(i + 1));
+        }
+    }
+}
+
+static void write_lua_to_list(lua_State *L, duckdb_vector out, duckdb_vector child, idx_t row) {
+    int n = (int)lua_objlen(L, -1); if (n == 0) return;
+    duckdb_type ct = duckdb_get_type_id(duckdb_vector_get_column_type(child));
+    idx_t cs = duckdb_list_vector_get_size(out);
+    duckdb_list_vector_reserve(out, cs + n);
+    list_entry_t *e = (list_entry_t *)duckdb_vector_get_data(out);
+    e[row].offset = cs; e[row].length = n;
+    duckdb_list_vector_set_size(out, cs + n);
+    for (int i = 0; i < n; i++) {
+        lua_rawgeti(L, -1, i + 1); idx_t p = cs + i;
+        if (ct == DUCKDB_TYPE_DOUBLE || ct == DUCKDB_TYPE_FLOAT)
+            ((double *)duckdb_vector_get_data(child))[p] = lua_isnumber(L, -1) ? lua_tonumber(L, -1) : 0.0;
+        else if (ct == DUCKDB_TYPE_BIGINT || ct == DUCKDB_TYPE_INTEGER)
+            ((int64_t *)duckdb_vector_get_data(child))[p] = lua_isnumber(L, -1) ? (int64_t)lua_tointeger(L, -1) : 0;
+        else if (ct == DUCKDB_TYPE_VARCHAR)
+            duckdb_vector_assign_string_element(child, p, lua_isstring(L, -1) ? lua_tostring(L, -1) : "");
+        lua_pop(L, 1);
+    }
+}
+
+static void fjl(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
+    L_(); lua_State *L = g_lua; if (!L) return;
+    idx_t nr = duckdb_data_chunk_get_size(in), nc = duckdb_data_chunk_get_column_count(in);
+    duckdb_vector oc = duckdb_list_vector_get_child(out);
+    for (idx_t r = 0; r < nr; r++) {
+        if (!resolve_udf(L, duckdb_data_chunk_get_vector(in, 0), r))
+            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); continue; }
+        for (idx_t c = 1; c < nc; c++)
+            push_list_to_lua(L, duckdb_data_chunk_get_vector(in, c),
+                             duckdb_list_vector_get_child(duckdb_data_chunk_get_vector(in, c)), r);
+        if (lua_pcall(L, (int)(nc - 1), 1, 0) != LUA_OK)
+            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); lua_pop(L, 1); continue; }
+        if (!lua_istable(L, -1))
+            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); lua_pop(L, 1); continue; }
+        write_lua_to_list(L, out, oc, r);
+        lua_pop(L, 1);
+    }
+}
+
 /* ── luajit_module() table function ── */
 
 typedef struct {
@@ -460,6 +526,20 @@ void luajit_register_module_functions(
     REG("luajit_f", fjf, DUCKDB_TYPE_DOUBLE)  VARGS(DUCKDB_TYPE_DOUBLE)  END();
     REG("luajit_b", fjb, DUCKDB_TYPE_BOOLEAN) VARGS(DUCKDB_TYPE_BOOLEAN) END();
     REG("luajit_m", fjm, DUCKDB_TYPE_DOUBLE)  VARGS(DUCKDB_TYPE_DOUBLE)  END();
+
+    /* luajit_l: LIST(BIGINT) args → LIST(DOUBLE) return */
+    { duckdb_scalar_function f = duckdb_create_scalar_function();
+      duckdb_scalar_function_set_name(f, "luajit_l");
+      duckdb_scalar_function_set_function(f, fjl);
+      duckdb_logical_type rt = duckdb_create_list_type(duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE));
+      duckdb_scalar_function_set_return_type(f, rt);
+      duckdb_destroy_logical_type(&rt);
+      duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_logical_type at = duckdb_create_list_type(duckdb_create_logical_type(DUCKDB_TYPE_BIGINT));
+      duckdb_scalar_function_set_varargs(f, at);
+      duckdb_destroy_logical_type(&at);
+      duckdb_register_scalar_function(conn, f);
+      duckdb_destroy_scalar_function(&f); }
     #undef REG
     #undef VARGS
     #undef END
