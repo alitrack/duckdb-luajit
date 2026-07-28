@@ -491,8 +491,7 @@ static agg_group_t *agg_find_group(uintptr_t key) {
 static idx_t agg_state_size(duckdb_function_info fi) { (void)fi; return 8; }
 static void agg_init(duckdb_function_info fi, duckdb_aggregate_state st) { (void)fi; memset(st, 0, 8); }
 
-static void agg_update(duckdb_function_info fi, duckdb_data_chunk in, duckdb_aggregate_state *states, idx_t nr) {
-    (void)fi; (void)nr;
+static void agg_update(duckdb_function_info fi, duckdb_data_chunk in, duckdb_aggregate_state *states) {
 
     if (!g_agg_udf) {
         duckdb_vector nv = duckdb_data_chunk_get_vector(in, 0);

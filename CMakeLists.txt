@@ -18,9 +18,6 @@ if (DEFINED TARGET_DUCKDB_VERSION_PATCH)
 endif()
 
 add_definitions(-DDUCKDB_EXTENSION_NAME=${EXTENSION_NAME})
-# Downgrade incompatible-pointer-types from error to warning.
-# GCC treats this as error on ARM; MSVC silently ignores unknown -W flags.
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-error=incompatible-pointer-types")
 
 if (DEFINED DUCKDB_EXTENSION_API_VERSION_UNSTABLE)
     add_definitions(-DDUCKDB_EXTENSION_API_VERSION_UNSTABLE=${DUCKDB_EXTENSION_API_VERSION_UNSTABLE})
