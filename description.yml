@@ -1,6 +1,6 @@
 name: luajit
-version: 0.4.0
-description: In-process JIT-compiled Lua UDFs via LuaJIT — luajit(), luajit_i(), luajit_f(), MACRO generation. Self-contained, cross-platform.
+version: 0.5.0
+description: In-process JIT-compiled Lua UDFs via LuaJIT — luajit(), luajit_i(), luajit_f(), luajit_b(), luajit_m(), MACRO generation, list/drop/reset, DuckDB callback. Self-contained, cross-platform.
 license: MIT
 maintainers:
   - alitrack

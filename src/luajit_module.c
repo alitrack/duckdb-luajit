@@ -1,12 +1,14 @@
 /*
- * luajit — DuckDB LuaJIT UDF Extension  v0.4
+ * luajit — DuckDB LuaJIT UDF Extension  v0.5
  * SPDX-License-Identifier: MIT
  *
- * - luajit(expr)          → VARCHAR  (inline eval)
- * - luajit_i(name, ...)   → BIGINT   (typed int UDF call)
- * - luajit_f(name, ...)   → DOUBLE   (typed float UDF call)
- * - luajit_module(compile) → store UDF as Lua global
- * - luajit_module(macro)   → generate CREATE MACRO DDL
+ * Full API:
+ *   luajit(expr)           → VARCHAR   inline eval
+ *   luajit_i(name, ...)    → BIGINT    typed int UDF
+ *   luajit_f(name, ...)    → DOUBLE    typed float UDF
+ *   luajit_b(name, ...)    → BOOLEAN   typed bool UDF
+ *   luajit_m(name, ...)    → DOUBLE    mixed-type (auto-cast to double)
+ *   luajit_module(modes):  info / compile / macro / list / drop / reset
  */
 
 #include "duckdb_extension.h"
@@ -14,10 +16,9 @@
 DUCKDB_EXTENSION_EXTERN
 
 #ifdef LUAJIT_WASM_STUB
-/* ── WASM stub: LuaJIT not available ── */
 void luajit_register_module_functions(
-    duckdb_connection conn, duckdb_extension_info ei, struct duckdb_extension_access *acc)
-{ (void)conn; (void)ei; (void)acc; }
+    duckdb_connection c, duckdb_extension_info e, struct duckdb_extension_access *a)
+{ (void)c; (void)e; (void)a; }
 #else
 
 #include "lua.h"
@@ -26,187 +27,324 @@ void luajit_register_module_functions(
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdint.h>
 
 static lua_State *g_lua = NULL;
-static void L_(void) { if (!g_lua) { g_lua = luaL_newstate(); if (g_lua) luaL_openlibs(g_lua); } }
+static duckdb_connection g_conn = NULL;
+
+/* ── DuckDB callback from Lua: _duckdb_call(sql) → status VARCHAR ── */
+static int l_duckdb_call(lua_State *L) {
+    if (!g_conn) { lua_pushstring(L, "no connection"); return 1; }
+    const char *sql = luaL_checkstring(L, 1);
+    duckdb_result res;
+    if (duckdb_query(g_conn, sql, &res) != DuckDBSuccess) {
+        lua_pushfstring(L, "error: %s", duckdb_result_error(&res));
+        duckdb_destroy_result(&res); return 1;
+    }
+    lua_pushstring(L, "ok");
+    duckdb_destroy_result(&res);
+    return 1;
+}
+
+static void L_(void) {
+    if (!g_lua) {
+        g_lua = luaL_newstate();
+        if (g_lua) {
+            luaL_openlibs(g_lua);
+            /* register DuckDB callback */
+            lua_pushcfunction(g_lua, l_duckdb_call);
+            lua_setglobal(g_lua, "_duckdb_call");
+        }
+    }
+}
+
+/* ── helpers ── */
+
+static void push_str(lua_State *L, duckdb_vector v, idx_t r) {
+    duckdb_string_t s=((duckdb_string_t*)duckdb_vector_get_data(v))[r];
+    if(!duckdb_validity_row_is_valid(duckdb_vector_get_validity(v),r))
+        lua_pushnil(L);
+    else lua_pushlstring(L,duckdb_string_t_data(&s),duckdb_string_t_length(s));
+}
+static void push_int(lua_State *L, duckdb_vector v, idx_t r) {
+    int64_t*d=(int64_t*)duckdb_vector_get_data(v);
+    if(!duckdb_validity_row_is_valid(duckdb_vector_get_validity(v),r))
+        lua_pushnil(L);
+    else lua_pushinteger(L,(lua_Integer)d[r]);
+}
+static void push_flt(lua_State *L, duckdb_vector v, idx_t r) {
+    double*d=(double*)duckdb_vector_get_data(v);
+    if(!duckdb_validity_row_is_valid(duckdb_vector_get_validity(v),r))
+        lua_pushnil(L);
+    else lua_pushnumber(L,d[r]);
+}
+static void push_bool(lua_State *L, duckdb_vector v, idx_t r) {
+    bool*d=(bool*)duckdb_vector_get_data(v);
+    if(!duckdb_validity_row_is_valid(duckdb_vector_get_validity(v),r))
+        lua_pushnil(L);
+    else
+        lua_pushinteger(L, d[r] ? 1 : 0); /* Lua boolean can't do arithmetic */
+}
+static void to_str(lua_State *L) {
+    if(lua_isnil(L,-1))return;if(lua_isstring(L,-1))return;
+    lua_getglobal(L,"tostring");lua_pushvalue(L,-2);lua_pcall(L,1,1,0);
+}
 
 /* ── luajit(str) → VARCHAR ── */
 
-static void f_luajit(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
-    L_(); lua_State *L = g_lua; if (!L) return;
-    idx_t n = duckdb_data_chunk_get_size(in);
-    for (idx_t r = 0; r < n; r++) {
-        duckdb_vector sv = duckdb_data_chunk_get_vector(in, 0);
-        duckdb_string_t ss = ((duckdb_string_t *)duckdb_vector_get_data(sv))[r];
-        if (!duckdb_validity_row_is_valid(duckdb_vector_get_validity(sv), r))
-            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); continue; }
-        int ok = luaL_loadbuffer(L, duckdb_string_t_data(&ss), duckdb_string_t_length(ss), "lj");
-        ok = ok || lua_pcall(L, 0, 1, 0);
-        if (ok) { duckdb_vector_assign_string_element(out, r, lua_tostring(L, -1)); lua_pop(L, 1); continue; }
-        if (lua_isnil(L, -1)) duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r);
-        else { lua_getglobal(L, "tostring"); lua_pushvalue(L, -2); lua_pcall(L, 1, 1, 0);
-               duckdb_vector_assign_string_element(out, r, lua_tostring(L, -1)); lua_pop(L, 1); }
-        lua_pop(L, 1);
+static void fj(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
+    L_();lua_State *L=g_lua;if(!L)return;
+    idx_t n=duckdb_data_chunk_get_size(in);
+    for(idx_t r=0;r<n;r++){
+        duckdb_vector sv=duckdb_data_chunk_get_vector(in,0);
+        duckdb_string_t ss=((duckdb_string_t*)duckdb_vector_get_data(sv))[r];
+        if(!duckdb_validity_row_is_valid(duckdb_vector_get_validity(sv),r))
+            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);continue;}
+        int ok=luaL_loadbuffer(L,duckdb_string_t_data(&ss),duckdb_string_t_length(ss),"lj");
+        ok=ok||lua_pcall(L,0,1,0);
+        if(ok){duckdb_vector_assign_string_element(out,r,lua_tostring(L,-1));lua_pop(L,1);continue;}
+        if(lua_isnil(L,-1))duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);
+        else{to_str(L);duckdb_vector_assign_string_element(out,r,lua_tostring(L,-1));lua_pop(L,1);}
+        lua_pop(L,1);
     }
 }
 
-/* ── luajit_i(name VARCHAR, ...BIGINT) → BIGINT ── */
+/* ── UDF executors ── */
 
-static void f_luajit_i(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
-    L_(); lua_State *L = g_lua; if (!L) return;
-    idx_t nr = duckdb_data_chunk_get_size(in);
-    idx_t nc = duckdb_data_chunk_get_column_count(in);
-    int64_t *od = (int64_t *)duckdb_vector_get_data(out);
-    for (idx_t r = 0; r < nr; r++) {
-        duckdb_vector nv = duckdb_data_chunk_get_vector(in, 0);
-        duckdb_string_t ns = ((duckdb_string_t *)duckdb_vector_get_data(nv))[r];
-        if (!duckdb_validity_row_is_valid(duckdb_vector_get_validity(nv), r))
-            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); continue; }
-        lua_getglobal(L, duckdb_string_t_data(&ns));
-        if (!lua_isfunction(L, -1))
-            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); lua_pop(L, 1); continue; }
-        for (idx_t c = 1; c < nc; c++) {
-            duckdb_vector v = duckdb_data_chunk_get_vector(in, c);
-            int64_t *d = (int64_t *)duckdb_vector_get_data(v);
-            if (!duckdb_validity_row_is_valid(duckdb_vector_get_validity(v), r))
-                lua_pushnil(L);
-            else
-                lua_pushinteger(L, (lua_Integer)d[r]);
-        }
-        if (lua_pcall(L, (int)(nc - 1), 1, 0) != LUA_OK)
-            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); lua_pop(L, 1); continue; }
-        if (lua_isnil(L, -1) || !lua_isnumber(L, -1))
-            duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r);
-        else
-            od[r] = (int64_t)lua_tointeger(L, -1);
-        lua_pop(L, 1);
+static int resolve_udf(lua_State *L, duckdb_vector nv, idx_t r) {
+    duckdb_string_t ns=((duckdb_string_t*)duckdb_vector_get_data(nv))[r];
+    if(!duckdb_validity_row_is_valid(duckdb_vector_get_validity(nv),r)) return 0;
+    lua_getglobal(L,duckdb_string_t_data(&ns));
+    int ok=lua_isfunction(L,-1);
+    if(!ok)lua_pop(L,1);
+    return ok;
+}
+
+/* luajit_i(name, ...BIGINT) → BIGINT */
+static void fji(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
+    L_();lua_State *L=g_lua;if(!L)return;
+    idx_t nr=duckdb_data_chunk_get_size(in),nc=duckdb_data_chunk_get_column_count(in);
+    int64_t*od=(int64_t*)duckdb_vector_get_data(out);
+    for(idx_t r=0;r<nr;r++){
+        if(!resolve_udf(L,duckdb_data_chunk_get_vector(in,0),r))
+            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);continue;}
+        for(idx_t c=1;c<nc;c++)push_int(L,duckdb_data_chunk_get_vector(in,c),r);
+        if(lua_pcall(L,(int)(nc-1),1,0)!=LUA_OK)
+            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);lua_pop(L,1);continue;}
+        if(lua_isnil(L,-1)||!lua_isnumber(L,-1))
+            duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);
+        else od[r]=(int64_t)lua_tointeger(L,-1);
+        lua_pop(L,1);
     }
 }
 
-/* ── luajit_f(name VARCHAR, ...DOUBLE) → DOUBLE ── */
+/* luajit_f(name, ...DOUBLE) → DOUBLE */
+static void fjf(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
+    L_();lua_State *L=g_lua;if(!L)return;
+    idx_t nr=duckdb_data_chunk_get_size(in),nc=duckdb_data_chunk_get_column_count(in);
+    double*od=(double*)duckdb_vector_get_data(out);
+    for(idx_t r=0;r<nr;r++){
+        if(!resolve_udf(L,duckdb_data_chunk_get_vector(in,0),r))
+            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);continue;}
+        for(idx_t c=1;c<nc;c++)push_flt(L,duckdb_data_chunk_get_vector(in,c),r);
+        if(lua_pcall(L,(int)(nc-1),1,0)!=LUA_OK)
+            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);lua_pop(L,1);continue;}
+        if(lua_isnil(L,-1)||!lua_isnumber(L,-1))
+            duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);
+        else od[r]=lua_tonumber(L,-1);
+        lua_pop(L,1);
+    }
+}
 
-static void f_luajit_f(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
-    L_(); lua_State *L = g_lua; if (!L) return;
-    idx_t nr = duckdb_data_chunk_get_size(in);
-    idx_t nc = duckdb_data_chunk_get_column_count(in);
-    double *od = (double *)duckdb_vector_get_data(out);
-    for (idx_t r = 0; r < nr; r++) {
-        duckdb_vector nv = duckdb_data_chunk_get_vector(in, 0);
-        duckdb_string_t ns = ((duckdb_string_t *)duckdb_vector_get_data(nv))[r];
-        if (!duckdb_validity_row_is_valid(duckdb_vector_get_validity(nv), r))
-            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); continue; }
-        lua_getglobal(L, duckdb_string_t_data(&ns));
-        if (!lua_isfunction(L, -1))
-            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); lua_pop(L, 1); continue; }
-        for (idx_t c = 1; c < nc; c++) {
-            duckdb_vector v = duckdb_data_chunk_get_vector(in, c);
-            double *d = (double *)duckdb_vector_get_data(v);
-            if (!duckdb_validity_row_is_valid(duckdb_vector_get_validity(v), r))
-                lua_pushnil(L);
+/* luajit_b(name, ...BOOLEAN) → BOOLEAN */
+static void fjb(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
+    L_();lua_State *L=g_lua;if(!L)return;
+    idx_t nr=duckdb_data_chunk_get_size(in),nc=duckdb_data_chunk_get_column_count(in);
+    bool*od=(bool*)duckdb_vector_get_data(out);
+    for(idx_t r=0;r<nr;r++){
+        if(!resolve_udf(L,duckdb_data_chunk_get_vector(in,0),r))
+            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);continue;}
+        for(idx_t c=1;c<nc;c++)push_bool(L,duckdb_data_chunk_get_vector(in,c),r);
+        if(lua_pcall(L,(int)(nc-1),1,0)!=LUA_OK)
+            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);lua_pop(L,1);continue;}
+        if(lua_isnil(L,-1))duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);
+        else if(lua_isboolean(L,-1))od[r]=lua_toboolean(L,-1)?true:false;
+        else if(lua_isnumber(L,-1))od[r]=lua_tonumber(L,-1)!=0.0;
+        else od[r]=lua_toboolean(L,-1)?true:false;
+        lua_pop(L,1);
+    }
+}
+
+/* luajit_m(name, ...DOUBLE) → DOUBLE  (mixed-type: all args auto-cast to double) */
+static void fjm(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
+    L_();lua_State *L=g_lua;if(!L)return;
+    idx_t nr=duckdb_data_chunk_get_size(in),nc=duckdb_data_chunk_get_column_count(in);
+    double*od=(double*)duckdb_vector_get_data(out);
+    for(idx_t r=0;r<nr;r++){
+        if(!resolve_udf(L,duckdb_data_chunk_get_vector(in,0),r))
+            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);continue;}
+        /* auto-cast: try as int, then as double */
+        for(idx_t c=1;c<nc;c++){
+            duckdb_vector v=duckdb_data_chunk_get_vector(in,c);
+            duckdb_type dt=duckdb_get_type_id(duckdb_vector_get_column_type(v));
+            if(dt==DUCKDB_TYPE_BIGINT||dt==DUCKDB_TYPE_INTEGER||dt==DUCKDB_TYPE_SMALLINT||dt==DUCKDB_TYPE_TINYINT)
+                push_int(L,v,r);
+            else if(dt==DUCKDB_TYPE_DOUBLE||dt==DUCKDB_TYPE_FLOAT)
+                push_flt(L,v,r);
+            else if(dt==DUCKDB_TYPE_BOOLEAN)
+                push_bool(L,v,r);
             else
-                lua_pushnumber(L, d[r]);
+                push_str(L,v,r);
         }
-        if (lua_pcall(L, (int)(nc - 1), 1, 0) != LUA_OK)
-            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); lua_pop(L, 1); continue; }
-        if (lua_isnil(L, -1) || !lua_isnumber(L, -1))
-            duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r);
-        else
-            od[r] = lua_tonumber(L, -1);
-        lua_pop(L, 1);
+        if(lua_pcall(L,(int)(nc-1),1,0)!=LUA_OK)
+            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);lua_pop(L,1);continue;}
+        if(lua_isnil(L,-1)||!lua_isnumber(L,-1))
+            duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);
+        else od[r]=lua_tonumber(L,-1);
+        lua_pop(L,1);
     }
 }
 
 /* ── luajit_module() table function ── */
 
-typedef struct { char *mode, *source, *sql_name, *msg; bool ok; } mod_bind_t;
-typedef struct { bool done; } mod_state_t;
+typedef struct {
+    char *mode, *source, *sql_name, *msg, *detail, *phase;
+    bool ok;
+} bind_t;
+typedef struct { bool done; } state_t;
 
 static void mod_bind(duckdb_bind_info info) {
-    mod_bind_t *d = (mod_bind_t *)duckdb_malloc(sizeof(mod_bind_t));
-    memset(d, 0, sizeof(*d)); d->mode = strdup("info");
-    #define G(n, f) do { \
-        duckdb_value v = duckdb_bind_get_named_parameter(info, n); \
-        if (v) { free(d->f); d->f = strdup(duckdb_get_varchar(v)); duckdb_destroy_value(&v); } \
-    } while (0)
-    G("mode", mode); G("source", source); G("sql_name", sql_name);
+    bind_t *d=(bind_t*)duckdb_malloc(sizeof(bind_t));
+    memset(d,0,sizeof(*d));d->mode=strdup("info");
+    #define G(n,f)do{duckdb_value v=duckdb_bind_get_named_parameter(info,n);\
+        if(v){free(d->f);d->f=strdup(duckdb_get_varchar(v));duckdb_destroy_value(&v);}}while(0)
+    G("mode",mode);G("source",source);G("sql_name",sql_name);
     #undef G
-    duckdb_bind_add_result_column(info, "ok", duckdb_create_logical_type(DUCKDB_TYPE_BOOLEAN));
-    duckdb_bind_add_result_column(info, "mode", duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-    duckdb_bind_add_result_column(info, "message", duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-    duckdb_bind_set_bind_data(info, d, free);
+    duckdb_bind_add_result_column(info,"ok",duckdb_create_logical_type(DUCKDB_TYPE_BOOLEAN));
+    duckdb_bind_add_result_column(info,"mode",duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+    duckdb_bind_add_result_column(info,"phase",duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+    duckdb_bind_add_result_column(info,"message",duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+    duckdb_bind_add_result_column(info,"detail",duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+    duckdb_bind_add_result_column(info,"sql_name",duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+    duckdb_bind_set_bind_data(info,d,free);
 }
 
 static void mod_init(duckdb_init_info info) {
-    mod_bind_t *d = (mod_bind_t *)duckdb_init_get_bind_data(info);
-    if (!d) return;
-    mod_state_t *s = (mod_state_t *)duckdb_malloc(sizeof(mod_state_t));
-    memset(s, 0, sizeof(*s));
-    duckdb_init_set_init_data(info, s, free);
+    bind_t *d=(bind_t*)duckdb_init_get_bind_data(info);
+    if(!d)return;
+    state_t *s=(state_t*)duckdb_malloc(sizeof(state_t));
+    memset(s,0,sizeof(*s));duckdb_init_set_init_data(info,s,free);
 
-    if (strcmp(d->mode, "info") == 0) { d->ok = true; return; }
-    if (strcmp(d->mode, "compile") != 0 && strcmp(d->mode, "macro") != 0)
-        { d->msg = strdup("bad mode"); return; }
+    const char *m=d->mode?d->mode:"info";
 
-    /* ── macro mode: generate CREATE MACRO DDL ── */
-    if (strcmp(d->mode, "macro") == 0) {
-        if (!d->sql_name) { d->msg = strdup("need sql_name for macro"); return; }
-        const char *var = "v";
-        if (d->source) {
-            if (strcmp(d->source, "i") == 0 || strcmp(d->source, "BIGINT") == 0) var = "i";
-            else if (strcmp(d->source, "f") == 0 || strcmp(d->source, "DOUBLE") == 0) var = "f";
+    /* ── info mode ── */
+    if(!strcmp(m,"info")){d->ok=true;d->phase="info";return;}
+
+    /* ── list mode: enumerate compiled UDFs ── */
+    if(!strcmp(m,"list")){
+        L_();lua_State *L=g_lua;
+        lua_getglobal(L,"_G");if(!lua_istable(L,-1)){d->msg=strdup("no globals");lua_pop(L,1);return;}
+        char buf[4096]="";int off=0;
+        lua_pushnil(L);
+        while(lua_next(L,-2)){
+            if(lua_isfunction(L,-1)&&lua_type(L,-2)==LUA_TSTRING){
+                const char *k=lua_tostring(L,-2);
+                /* skip Lua builtins — only show user-compiled UDFs */
+                if(k[0]!='_' /* skip __pairs etc */
+                   && strcmp(k,"assert")&&strcmp(k,"collectgarbage")&&strcmp(k,"dofile")
+                   && strcmp(k,"error")&&strcmp(k,"gcinfo")&&strcmp(k,"getfenv")
+                   && strcmp(k,"getmetatable")&&strcmp(k,"ipairs")&&strcmp(k,"load")
+                   && strcmp(k,"loadfile")&&strcmp(k,"loadstring")&&strcmp(k,"module")
+                   && strcmp(k,"newproxy")&&strcmp(k,"next")&&strcmp(k,"pairs")
+                   && strcmp(k,"pcall")&&strcmp(k,"print")&&strcmp(k,"rawequal")
+                   && strcmp(k,"rawget")&&strcmp(k,"rawset")&&strcmp(k,"require")
+                   && strcmp(k,"select")&&strcmp(k,"setfenv")&&strcmp(k,"setmetatable")
+                   && strcmp(k,"tonumber")&&strcmp(k,"tostring")&&strcmp(k,"type")
+                   && strcmp(k,"unpack")&&strcmp(k,"xpcall"))
+                    off+=snprintf(buf+off,sizeof(buf)-off,"%s%s",off?", ":"",k);
+            }
+            lua_pop(L,1);
         }
-        const char *fn = (*var == 'i') ? "luajit_i" : (*var == 'f') ? "luajit_f" : "luajit";
-        char buf[4096];
-        int off = snprintf(buf, sizeof(buf), "CREATE OR REPLACE MACRO %s(", d->sql_name);
-        int nargs = 2;
-        L_(); lua_State *L = g_lua;
-        lua_getglobal(L, d->sql_name);
-        if (lua_isfunction(L, -1)) {
-            lua_getglobal(L, "debug"); lua_getfield(L, -1, "getinfo");
-            lua_pushvalue(L, -3); lua_pushstring(L, "u");
-            if (lua_pcall(L, 2, 1, 0) == LUA_OK && lua_istable(L, -1))
-                { lua_getfield(L, -1, "nparams"); nargs = (int)lua_tointeger(L, -1); lua_pop(L, 1); }
-            lua_pop(L, 2);
+        lua_pop(L,1);
+        d->ok=true;d->phase="list";d->msg=strdup("UDFs");d->detail=strdup(buf[0]?buf:"(none)");
+        d->sql_name=strdup(buf[0]?buf:"");
+        return;
+    }
+
+    /* ── drop mode: remove a compiled UDF ── */
+    if(!strcmp(m,"drop")){
+        if(!d->sql_name){d->msg=strdup("need sql_name");return;}
+        L_();lua_State *L=g_lua;
+        lua_pushnil(L);lua_setglobal(L,d->sql_name);
+        d->ok=true;d->phase="drop";d->sql_name=strdup(d->sql_name);
+        return;
+    }
+
+    /* ── reset mode: clear all UDFs ── */
+    if(!strcmp(m,"reset")){
+        L_();if(g_lua){lua_close(g_lua);g_lua=NULL;}L_();
+        d->ok=true;d->phase="reset";d->msg=strdup("Lua state reset");
+        return;
+    }
+
+    /* ── macro mode ── */
+    if(!strcmp(m,"macro")){
+        if(!d->sql_name){d->msg=strdup("need sql_name for macro");return;}
+        const char *var="v";
+        if(d->source){
+            if(!strcmp(d->source,"i")||!strcmp(d->source,"BIGINT"))var="i";
+            else if(!strcmp(d->source,"f")||!strcmp(d->source,"DOUBLE"))var="f";
+            else if(!strcmp(d->source,"b")||!strcmp(d->source,"BOOLEAN"))var="b";
+            else if(!strcmp(d->source,"m")||!strcmp(d->source,"MIXED"))var="m";
         }
-        lua_pop(L, 1);
-        for (int i = 0; i < nargs; i++)
-            off += snprintf(buf + off, sizeof(buf) - off, "%sx%d", i > 0 ? ", " : "", i + 1);
-        off += snprintf(buf + off, sizeof(buf) - off, ") AS %s('", fn);
-        off += snprintf(buf + off, sizeof(buf) - off, "%s'", d->sql_name);
-        for (int i = 0; i < nargs; i++)
-            off += snprintf(buf + off, sizeof(buf) - off, ", x%d", i + 1);
-        snprintf(buf + off, sizeof(buf) - off, ")");
-        d->ok = true; d->msg = strdup(buf);
+        const char *fn=*var=='i'?"luajit_i":*var=='f'?"luajit_f":*var=='b'?"luajit_b":*var=='m'?"luajit_m":"luajit";
+        char buf[4096];int off=snprintf(buf,sizeof(buf),"CREATE OR REPLACE MACRO %s(",d->sql_name);
+        int nargs=2;
+        L_();lua_State *L=g_lua;lua_getglobal(L,d->sql_name);
+        if(lua_isfunction(L,-1)){
+            lua_getglobal(L,"debug");lua_getfield(L,-1,"getinfo");
+            lua_pushvalue(L,-3);lua_pushstring(L,"u");
+            if(lua_pcall(L,2,1,0)==LUA_OK&&lua_istable(L,-1))
+                {lua_getfield(L,-1,"nparams");nargs=(int)lua_tointeger(L,-1);lua_pop(L,1);}
+            lua_pop(L,2);
+        }
+        lua_pop(L,1);
+        for(int i=0;i<nargs;i++)off+=snprintf(buf+off,sizeof(buf)-off,"%sx%d",i>0?", ":"",i+1);
+        off+=snprintf(buf+off,sizeof(buf)-off,") AS %s('",fn);
+        off+=snprintf(buf+off,sizeof(buf)-off,"%s'",d->sql_name);
+        for(int i=0;i<nargs;i++)off+=snprintf(buf+off,sizeof(buf)-off,", x%d",i+1);
+        snprintf(buf+off,sizeof(buf)-off,")");
+        d->ok=true;d->phase="macro";d->detail=strdup(buf);d->sql_name=strdup(d->sql_name);
         return;
     }
 
     /* ── compile mode ── */
-    if (!d->source || !d->sql_name) { d->msg = strdup("need source+sql_name"); return; }
-
-    L_(); lua_State *L = g_lua;
-    if (!L) { d->msg = strdup("no Lua"); return; }
-
-    if (luaL_loadstring(L, d->source) != LUA_OK)
-        { d->msg = strdup(lua_tostring(L, -1)); lua_pop(L, 1); return; }
-    if (lua_pcall(L, 0, 1, 0) != LUA_OK)
-        { d->msg = strdup(lua_tostring(L, -1)); lua_pop(L, 1); return; }
-    if (!lua_isfunction(L, -1))
-        { d->msg = strdup("must return a function"); lua_pop(L, 1); return; }
-
-    lua_setglobal(L, d->sql_name);
-    d->ok = true; d->msg = NULL;
+    if(strcmp(m,"compile")){d->msg=strdup("bad mode");return;}
+    if(!d->source||!d->sql_name){d->msg=strdup("need source+sql_name");return;}
+    L_();lua_State *L=g_lua;
+    if(!L){d->msg=strdup("no Lua");return;}
+    d->phase="compile";
+    if(luaL_loadstring(L,d->source)!=LUA_OK)
+        {d->msg=strdup(lua_tostring(L,-1));lua_pop(L,1);return;}
+    if(lua_pcall(L,0,1,0)!=LUA_OK)
+        {d->msg=strdup(lua_tostring(L,-1));lua_pop(L,1);return;}
+    if(!lua_isfunction(L,-1))
+        {d->msg=strdup("must return a function");lua_pop(L,1);return;}
+    lua_setglobal(L,d->sql_name);
+    d->ok=true;d->sql_name=strdup(d->sql_name);
 }
 
 static void mod_func(duckdb_function_info fi, duckdb_data_chunk out) {
-    mod_bind_t *d = (mod_bind_t *)duckdb_function_get_bind_data(fi);
-    mod_state_t *s = (mod_state_t *)duckdb_function_get_init_data(fi);
-    if (!d || !s || s->done) { duckdb_data_chunk_set_size(out, 0); return; }
-    duckdb_data_chunk_set_size(out, 1);
-    ((bool *)duckdb_vector_get_data(duckdb_data_chunk_get_vector(out, 0)))[0] = d->ok;
-    duckdb_vector_assign_string_element(duckdb_data_chunk_get_vector(out, 1), 0, d->mode ? d->mode : "?");
-    duckdb_vector_assign_string_element(duckdb_data_chunk_get_vector(out, 2), 0,
-        d->msg ? d->msg : (d->ok ? "OK" : "ERROR"));
-    s->done = true;
+    bind_t *d=(bind_t*)duckdb_function_get_bind_data(fi);
+    state_t *s=(state_t*)duckdb_function_get_init_data(fi);
+    if(!d||!s||s->done){duckdb_data_chunk_set_size(out,0);return;}
+    duckdb_data_chunk_set_size(out,1);
+    #define C(n,val) duckdb_vector_assign_string_element(duckdb_data_chunk_get_vector(out,n),0,val?val:"")
+    ((bool*)duckdb_vector_get_data(duckdb_data_chunk_get_vector(out,0)))[0]=d->ok;
+    C(1,d->mode);C(2,d->phase);C(3,d->msg?d->msg:(d->ok?"OK":"ERROR"));
+    C(4,d->detail);C(5,d->sql_name);
+    #undef C
+    s->done=true;
 }
 
 /* ── Registration ── */
@@ -214,41 +352,44 @@ static void mod_func(duckdb_function_info fi, duckdb_data_chunk out) {
 void luajit_register_module_functions(
     duckdb_connection conn, duckdb_extension_info ei, struct duckdb_extension_access *acc)
 {
-    (void)ei; (void)acc;
+    (void)ei;(void)acc;
     L_();
 
-    { duckdb_scalar_function f = duckdb_create_scalar_function();
-      duckdb_scalar_function_set_name(f, "luajit");
-      duckdb_scalar_function_set_function(f, f_luajit);
-      duckdb_scalar_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-      duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-      duckdb_register_scalar_function(conn, f); duckdb_destroy_scalar_function(&f); }
+    /* Create persistent connection for Lua→DuckDB callbacks */
+    if (!g_conn) {
+        duckdb_database *db = acc->get_database(ei);
+        if (db) duckdb_connect(*db, &g_conn);
+    }
 
-    { duckdb_scalar_function f = duckdb_create_scalar_function();
-      duckdb_scalar_function_set_name(f, "luajit_i");
-      duckdb_scalar_function_set_function(f, f_luajit_i);
-      duckdb_scalar_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_BIGINT));
-      duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-      duckdb_scalar_function_set_varargs(f, duckdb_create_logical_type(DUCKDB_TYPE_BIGINT));
-      duckdb_register_scalar_function(conn, f); duckdb_destroy_scalar_function(&f); }
+    #define REG(name,fn,rt) do{\
+        duckdb_scalar_function f=duckdb_create_scalar_function();\
+        duckdb_scalar_function_set_name(f,name);\
+        duckdb_scalar_function_set_function(f,fn);\
+        duckdb_scalar_function_set_return_type(f,duckdb_create_logical_type(rt));\
+        duckdb_scalar_function_add_parameter(f,duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
 
-    { duckdb_scalar_function f = duckdb_create_scalar_function();
-      duckdb_scalar_function_set_name(f, "luajit_f");
-      duckdb_scalar_function_set_function(f, f_luajit_f);
-      duckdb_scalar_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE));
-      duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-      duckdb_scalar_function_set_varargs(f, duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE));
-      duckdb_register_scalar_function(conn, f); duckdb_destroy_scalar_function(&f); }
+    #define VARGS(t) duckdb_scalar_function_set_varargs(f,duckdb_create_logical_type(t));
+    #define END() duckdb_register_scalar_function(conn,f);duckdb_destroy_scalar_function(&f);}while(0)
 
-    { duckdb_table_function t = duckdb_create_table_function();
-      duckdb_table_function_set_name(t, "luajit_module");
-      duckdb_table_function_add_named_parameter(t, "mode", duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-      duckdb_table_function_add_named_parameter(t, "source", duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-      duckdb_table_function_add_named_parameter(t, "sql_name", duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-      duckdb_table_function_set_bind(t, mod_bind);
-      duckdb_table_function_set_init(t, mod_init);
-      duckdb_table_function_set_function(t, mod_func);
-      duckdb_register_table_function(conn, t); duckdb_destroy_table_function(&t); }
+    REG("luajit",   fj,  DUCKDB_TYPE_VARCHAR) END();
+    REG("luajit_i", fji, DUCKDB_TYPE_BIGINT)  VARGS(DUCKDB_TYPE_BIGINT)  END();
+    REG("luajit_f", fjf, DUCKDB_TYPE_DOUBLE)  VARGS(DUCKDB_TYPE_DOUBLE)  END();
+    REG("luajit_b", fjb, DUCKDB_TYPE_BOOLEAN) VARGS(DUCKDB_TYPE_BOOLEAN) END();
+    REG("luajit_m", fjm, DUCKDB_TYPE_DOUBLE)  VARGS(DUCKDB_TYPE_DOUBLE)  END();
+    #undef REG
+    #undef VARGS
+    #undef END
+
+    duckdb_table_function t=duckdb_create_table_function();
+    duckdb_table_function_set_name(t,"luajit_module");
+    duckdb_table_function_add_named_parameter(t,"mode",duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+    duckdb_table_function_add_named_parameter(t,"source",duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+    duckdb_table_function_add_named_parameter(t,"sql_name",duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+    duckdb_table_function_set_bind(t,mod_bind);
+    duckdb_table_function_set_init(t,mod_init);
+    duckdb_table_function_set_function(t,mod_func);
+    duckdb_register_table_function(conn,t);
+    duckdb_destroy_table_function(&t);
 }
 
 #endif /* !LUAJIT_WASM_STUB */

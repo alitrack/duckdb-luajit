@@ -1,0 +1,59 @@
+# name: luajit v0.5 full API
+# description: Test all luajit functions
+
+# inline eval
+query T
+SELECT luajit('return 1 + 2')
+----
+3
+
+# BOOLEAN UDF
+statement ok
+SELECT ok FROM luajit_module(mode:='compile',source:='return function(x) return x>0 end',sql_name:='pos')
+
+query T
+SELECT luajit_b('pos',true)::VARCHAR
+----
+true
+
+# typed BIGINT
+statement ok
+SELECT ok FROM luajit_module(mode:='compile',source:='return function(x) return x*x end',sql_name:='sq')
+
+query I
+SELECT luajit_i('sq', 5)
+----
+25
+
+# mixed-type DOUBLE
+statement ok
+SELECT ok FROM luajit_module(mode:='compile',source:='return function(a,b) return a+b end',sql_name:='add')
+
+query T
+SELECT luajit_m('add', 1::BIGINT, 2::DOUBLE)::VARCHAR
+----
+3.0
+
+# list UDFs
+query T
+SELECT detail FROM luajit_module(mode:='list')
+----
+add, sq, pos
+
+# drop
+statement ok
+SELECT ok FROM luajit_module(mode:='drop', sql_name:='pos')
+
+query T
+SELECT detail FROM luajit_module(mode:='list')
+----
+add, sq
+
+# reset
+statement ok
+SELECT ok FROM luajit_module(mode:='reset')
+
+query T
+SELECT detail FROM luajit_module(mode:='list')
+----
+(none)

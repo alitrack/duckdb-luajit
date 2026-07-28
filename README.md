@@ -1,30 +1,20 @@
-# luajit — DuckDB LuaJIT UDF Extension
+# luajit — DuckDB LuaJIT UDF Extension  v0.5
 
 Self-contained DuckDB extension for Lua expressions and JIT-compiled UDFs via LuaJIT.
-**~700KB, zero external dependencies, cross-platform.**
 
 ```sql
 LOAD luajit;
 
--- Inline Lua evaluation (returns VARCHAR)
-SELECT luajit('return 1 + 2');                            -- '3'
-SELECT luajit('return _VERSION');                          -- 'Lua 5.1'
+-- Inline eval
+SELECT luajit('return 1 + 2');              -- '3'
+SELECT luajit('return _VERSION');            -- 'Lua 5.1'
 
--- Compile UDF as a named Lua global
+-- Compile UDF
 SELECT ok FROM luajit_module(
     mode := 'compile',
     source := 'return function(a, b) return a + b end',
     sql_name := 'add'
 );
-
--- Typed call (BIGINT → BIGINT)
-SELECT luajit_i('add', 3, 4);                              -- 7
-
--- Typed call (DOUBLE → DOUBLE)
-SELECT luajit_f('add', 3::DOUBLE, 4::DOUBLE);              -- 7.0
-
--- String call (VARCHAR → VARCHAR)
-SELECT luajit('return add(3, 4)');                         -- '7'
 ```
 
 ## Typed UDF API
@@ -32,95 +22,77 @@ SELECT luajit('return add(3, 4)');                         -- '7'
 | Function | Input | Output | Use |
 |----------|-------|--------|-----|
 | `luajit(expr)` | VARCHAR | VARCHAR | Inline eval, string UDFs |
-| `luajit_i(name, ...)` | VARCHAR + varargs BIGINT | BIGINT | Integer math UDFs |
-| `luajit_f(name, ...)` | VARCHAR + varargs DOUBLE | DOUBLE | Floating-point UDFs |
-| `luajit_module(mode:='info')` | — | table | Extension version |
-| `luajit_module(mode:='compile', source, sql_name)` | — | table | Store UDF as Lua global |
-| `luajit_module(mode:='macro', sql_name, source)` | — | table | Generate `CREATE MACRO` DDL |
+| `luajit_i(name, ...)` | VARCHAR + varargs BIGINT | BIGINT | Integer math |
+| `luajit_f(name, ...)` | VARCHAR + varargs DOUBLE | DOUBLE | Floating-point |
+| `luajit_b(name, ...)` | VARCHAR + varargs BOOLEAN | BOOLEAN | Predicates, filters |
+| `luajit_m(name, ...)` | VARCHAR + varargs DOUBLE | DOUBLE | Mixed-type (auto-cast) |
+| `_duckdb_call(sql)` | Lua global (internal) | status | Call DuckDB SQL from Lua UDFs |
+
+```sql
+SELECT luajit_i('add', 3, 4);                -- 7 (BIGINT)
+SELECT luajit_f('add', 3::DOUBLE, 4::DOUBLE); -- 7.0 (DOUBLE)
+SELECT luajit_b('gt0', 42::BOOLEAN);          -- true (BOOLEAN)
+SELECT luajit_m('add', 3, 4::DOUBLE);         -- 7.0 (mixed, auto-cast)
+```
+
+## Module API (luajit_module modes)
+
+| Mode | Description |
+|------|-------------|
+| `info` | Extension version info |
+| `compile` | Compile Lua source, store as global |
+| `macro` | Generate `CREATE MACRO` DDL |
+| `list` | List all compiled UDFs |
+| `drop` | Remove a UDF by name |
+| `reset` | Clear all UDFs (fresh Lua state) |
+
+```sql
+-- List
+SELECT detail FROM luajit_module(mode := 'list');   -- "add, sq, pos"
+
+-- Drop one
+SELECT ok FROM luajit_module(mode := 'drop', sql_name := 'pos');
+
+-- Reset all
+SELECT ok FROM luajit_module(mode := 'reset');
+```
+
+Result columns: `ok BOOLEAN, mode VARCHAR, phase VARCHAR, message VARCHAR, detail VARCHAR, sql_name VARCHAR`
 
 ## MACRO Sugar
 
-Turn any compiled UDF into a first-class SQL function:
-
 ```sql
--- Compile
-SELECT ok FROM luajit_module(
-    mode := 'compile',
-    source := 'return function(x) return x * x end',
-    sql_name := 'sq'
-);
-
--- Generate CREATE MACRO DDL (auto-detects arity)
 SELECT message FROM luajit_module(
-    mode := 'macro',
-    sql_name := 'sq',
-    source := 'i'        -- 'i'=BIGINT, 'f'=DOUBLE, default VARCHAR
+    mode := 'macro', sql_name := 'add', source := 'i'
 );
---> CREATE OR REPLACE MACRO sq(x1) AS luajit_i('sq', x1)
-
--- Execute the DDL, then call naturally
-SELECT sq(5);                                              -- 25
+--> CREATE OR REPLACE MACRO add(x1,x2) AS luajit_i('add', x1, x2)
 ```
 
-## Table Data
+## Lua→DuckDB Callback
+
+Lua UDFs can call DuckDB SQL via `_duckdb_call(sql)`:
 
 ```sql
-CREATE TABLE t AS SELECT * FROM (VALUES (1), (2), (3)) t(v);
-
--- Compile a UDF
-SELECT ok FROM luajit_module(
-    mode := 'compile',
-    source := 'return function(x) return x * 10 end',
-    sql_name := 'mul10'
-);
-
--- Apply to every row (typed BIGINT)
-SELECT v, luajit_i('mul10', v) FROM t ORDER BY v;
---  (1, 10), (2, 20), (3, 30)
-
--- String concatenation via luajit()
-SELECT v, luajit('return mul10(' || v || ')') FROM t;
+SELECT luajit('return _duckdb_call("CREATE TABLE log(ts TIMESTAMP DEFAULT NOW())")');
+SELECT luajit('return _duckdb_call("INSERT INTO log DEFAULT VALUES")');
 ```
 
-## Advanced: Multiple UDFs
-
-UDFs are stored as Lua globals — per-function dispatch is automatic:
-
-```sql
-SELECT ok FROM luajit_module(mode:='compile',
-    source:='return function(s) return string.upper(s) end', sql_name:='up');
-SELECT ok FROM luajit_module(mode:='compile',
-    source:='return function(x) return x * 2 end', sql_name:='dbl');
-
--- Both work correctly (no cross-UDF pollution)
-SELECT luajit('return up("hello")'), luajit('return dbl(21)');
--- 'HELLO', '42'
-```
+This enables UDFs that write audit logs, maintain counters, or interact with DuckDB's SQL engine from within Lua.
 
 ## Design
 
-- **LuaJIT** (MIT): trace-based JIT compiles hot paths to native code
-- **UDFs as Lua globals**: no per-function DuckDB registration overhead, no extra_info issues
-- **Varargs**: `luajit_i`/`luajit_f` use `duckdb_scalar_function_set_varargs` for arbitrary arity
-- **Self-contained**: ~700KB, LuaJIT statically linked, no system Lua required
-- **Cross-platform**: Linux / macOS / Windows via native build; WASM skeleton provided
+- **LuaJIT** (MIT): trace-based JIT, ~700KB, self-contained
+- **Per-type executors**: BIGINT/DOUBLE/BOOLEAN/MIXED avoid string conversion
+- **Chunk processing**: DuckDB feeds data chunks; row-by-row Lua calls inside
+- **Session management**: list/drop/reset for UDF lifecycle
+- **FFI bridge**: `_duckdb_call` exposes DuckDB query execution to Lua
 
 ## Build
 
 ```sh
-git clone https://github.com/alitrack/luajit.git
-cd luajit
-./bootstrap.sh        # clones extension-ci-tools + LuaJIT
-make release
-make test_release
+git clone https://github.com/alitrack/luajit.git && cd luajit
+./bootstrap.sh && make release && make test_release
 ```
-
-## Limitations (v0.4)
-
-- UDF args/return are all the same type per variant (all-BIGINT or all-DOUBLE)
-- No nested types (LIST, STRUCT, MAP) — string-only for complex data
-- No persistent UDF storage across sessions (rebuild on each LOAD)
-- WASM builds compile but without Lua (stub mode); PUC Lua or interpreter-mode LuaJIT needed
 
 ## License
 
