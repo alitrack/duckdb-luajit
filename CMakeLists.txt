@@ -25,28 +25,29 @@ endif()
 
 ###
 # LuaJIT — built via its own Makefile as an imported static library
+# Skip when building for WASM (use PUC Lua or interpreter-mode LuaJIT instead)
 ###
-set(LUAJIT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/LuaJIT)
-set(LUAJIT_LIB ${LUAJIT_DIR}/src/libluajit.a)
+if(NOT DUCKDB_WASM_EXTENSION)
+    set(LUAJIT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/LuaJIT)
+    set(LUAJIT_LIB ${LUAJIT_DIR}/src/libluajit.a)
 
-# Build LuaJIT using its own Makefile
-add_custom_command(
-    OUTPUT ${LUAJIT_LIB}
-    COMMAND make -C ${LUAJIT_DIR} -j$(nproc) BUILDMODE=static XCFLAGS=-fPIC
-    COMMENT "Building LuaJIT..."
-    WORKING_DIRECTORY ${LUAJIT_DIR}
-)
+    add_custom_command(
+        OUTPUT ${LUAJIT_LIB}
+        COMMAND make -C ${LUAJIT_DIR} -j$(nproc) BUILDMODE=static XCFLAGS=-fPIC
+        COMMENT "Building LuaJIT..."
+        WORKING_DIRECTORY ${LUAJIT_DIR}
+    )
 
-add_custom_target(luajit_runtime ALL DEPENDS ${LUAJIT_LIB})
+    add_custom_target(luajit_runtime ALL DEPENDS ${LUAJIT_LIB})
 
-# Create an imported library target for LuaJIT
-add_library(luajit_imported STATIC IMPORTED)
-set_target_properties(luajit_imported PROPERTIES
-    IMPORTED_LOCATION ${LUAJIT_LIB}
-)
-target_include_directories(luajit_imported INTERFACE ${LUAJIT_DIR}/src)
-target_link_libraries(luajit_imported INTERFACE dl m)
-add_dependencies(luajit_imported luajit_runtime)
+    add_library(luajit_imported STATIC IMPORTED)
+    set_target_properties(luajit_imported PROPERTIES
+        IMPORTED_LOCATION ${LUAJIT_LIB}
+    )
+    target_include_directories(luajit_imported INTERFACE ${LUAJIT_DIR}/src)
+    target_link_libraries(luajit_imported INTERFACE dl m)
+    add_dependencies(luajit_imported luajit_runtime)
+endif()
 
 ###
 # Build Extension
@@ -60,6 +61,7 @@ set(EXTENSION_SOURCES
 
 if (DUCKDB_WASM_EXTENSION)
     add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES})
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE LUAJIT_WASM_STUB)
 else()
     add_library(${EXTENSION_NAME} SHARED ${EXTENSION_SOURCES})
 endif()
@@ -69,15 +71,11 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 set(VISIBILITY_INLINES_HIDDEN ON)
 
-# Include own headers
 target_include_directories(${EXTENSION_NAME} PRIVATE src/include)
-
-# Include DuckDB C API headers
 target_include_directories(${EXTENSION_NAME} PRIVATE duckdb_capi)
 
-# Include LuaJIT headers
-target_include_directories(${EXTENSION_NAME} PRIVATE ${LUAJIT_DIR}/src)
-
-# Link LuaJIT
-target_link_libraries(${EXTENSION_NAME} PRIVATE luajit_imported)
-add_dependencies(${EXTENSION_NAME} luajit_runtime)
+if(NOT DUCKDB_WASM_EXTENSION)
+    target_include_directories(${EXTENSION_NAME} PRIVATE ${LUAJIT_DIR}/src)
+    target_link_libraries(${EXTENSION_NAME} PRIVATE luajit_imported)
+    add_dependencies(${EXTENSION_NAME} luajit_runtime)
+endif()

@@ -6,11 +6,19 @@
  * - luajit_i(name, ...)   → BIGINT   (typed int UDF call)
  * - luajit_f(name, ...)   → DOUBLE   (typed float UDF call)
  * - luajit_module(compile) → store UDF as Lua global
+ * - luajit_module(macro)   → generate CREATE MACRO DDL
  */
 
 #include "duckdb_extension.h"
 
 DUCKDB_EXTENSION_EXTERN
+
+#ifdef LUAJIT_WASM_STUB
+/* ── WASM stub: LuaJIT not available ── */
+void luajit_register_module_functions(
+    duckdb_connection conn, duckdb_extension_info ei, struct duckdb_extension_access *acc)
+{ (void)conn; (void)ei; (void)acc; }
+#else
 
 #include "lua.h"
 #include "lauxlib.h"
@@ -136,7 +144,43 @@ static void mod_init(duckdb_init_info info) {
     duckdb_init_set_init_data(info, s, free);
 
     if (strcmp(d->mode, "info") == 0) { d->ok = true; return; }
-    if (strcmp(d->mode, "compile") != 0) { d->msg = strdup("bad mode"); return; }
+    if (strcmp(d->mode, "compile") != 0 && strcmp(d->mode, "macro") != 0)
+        { d->msg = strdup("bad mode"); return; }
+
+    /* ── macro mode: generate CREATE MACRO DDL ── */
+    if (strcmp(d->mode, "macro") == 0) {
+        if (!d->sql_name) { d->msg = strdup("need sql_name for macro"); return; }
+        const char *var = "v";
+        if (d->source) {
+            if (strcmp(d->source, "i") == 0 || strcmp(d->source, "BIGINT") == 0) var = "i";
+            else if (strcmp(d->source, "f") == 0 || strcmp(d->source, "DOUBLE") == 0) var = "f";
+        }
+        const char *fn = (*var == 'i') ? "luajit_i" : (*var == 'f') ? "luajit_f" : "luajit";
+        char buf[4096];
+        int off = snprintf(buf, sizeof(buf), "CREATE OR REPLACE MACRO %s(", d->sql_name);
+        int nargs = 2;
+        L_(); lua_State *L = g_lua;
+        lua_getglobal(L, d->sql_name);
+        if (lua_isfunction(L, -1)) {
+            lua_getglobal(L, "debug"); lua_getfield(L, -1, "getinfo");
+            lua_pushvalue(L, -3); lua_pushstring(L, "u");
+            if (lua_pcall(L, 2, 1, 0) == LUA_OK && lua_istable(L, -1))
+                { lua_getfield(L, -1, "nparams"); nargs = (int)lua_tointeger(L, -1); lua_pop(L, 1); }
+            lua_pop(L, 2);
+        }
+        lua_pop(L, 1);
+        for (int i = 0; i < nargs; i++)
+            off += snprintf(buf + off, sizeof(buf) - off, "%sx%d", i > 0 ? ", " : "", i + 1);
+        off += snprintf(buf + off, sizeof(buf) - off, ") AS %s('", fn);
+        off += snprintf(buf + off, sizeof(buf) - off, "%s'", d->sql_name);
+        for (int i = 0; i < nargs; i++)
+            off += snprintf(buf + off, sizeof(buf) - off, ", x%d", i + 1);
+        snprintf(buf + off, sizeof(buf) - off, ")");
+        d->ok = true; d->msg = strdup(buf);
+        return;
+    }
+
+    /* ── compile mode ── */
     if (!d->source || !d->sql_name) { d->msg = strdup("need source+sql_name"); return; }
 
     L_(); lua_State *L = g_lua;
@@ -173,52 +217,38 @@ void luajit_register_module_functions(
     (void)ei; (void)acc;
     L_();
 
-    /* luajit(str) → VARCHAR */
-    {
-        duckdb_scalar_function f = duckdb_create_scalar_function();
-        duckdb_scalar_function_set_name(f, "luajit");
-        duckdb_scalar_function_set_function(f, f_luajit);
-        duckdb_scalar_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-        duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-        duckdb_register_scalar_function(conn, f);
-        duckdb_destroy_scalar_function(&f);
-    }
+    { duckdb_scalar_function f = duckdb_create_scalar_function();
+      duckdb_scalar_function_set_name(f, "luajit");
+      duckdb_scalar_function_set_function(f, f_luajit);
+      duckdb_scalar_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_register_scalar_function(conn, f); duckdb_destroy_scalar_function(&f); }
 
-    /* luajit_i(name VARCHAR, ...BIGINT) → BIGINT */
-    {
-        duckdb_scalar_function f = duckdb_create_scalar_function();
-        duckdb_scalar_function_set_name(f, "luajit_i");
-        duckdb_scalar_function_set_function(f, f_luajit_i);
-        duckdb_scalar_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_BIGINT));
-        duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-        duckdb_scalar_function_set_varargs(f, duckdb_create_logical_type(DUCKDB_TYPE_BIGINT));
-        duckdb_register_scalar_function(conn, f);
-        duckdb_destroy_scalar_function(&f);
-    }
+    { duckdb_scalar_function f = duckdb_create_scalar_function();
+      duckdb_scalar_function_set_name(f, "luajit_i");
+      duckdb_scalar_function_set_function(f, f_luajit_i);
+      duckdb_scalar_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_BIGINT));
+      duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_scalar_function_set_varargs(f, duckdb_create_logical_type(DUCKDB_TYPE_BIGINT));
+      duckdb_register_scalar_function(conn, f); duckdb_destroy_scalar_function(&f); }
 
-    /* luajit_f(name VARCHAR, ...DOUBLE) → DOUBLE */
-    {
-        duckdb_scalar_function f = duckdb_create_scalar_function();
-        duckdb_scalar_function_set_name(f, "luajit_f");
-        duckdb_scalar_function_set_function(f, f_luajit_f);
-        duckdb_scalar_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE));
-        duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-        duckdb_scalar_function_set_varargs(f, duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE));
-        duckdb_register_scalar_function(conn, f);
-        duckdb_destroy_scalar_function(&f);
-    }
+    { duckdb_scalar_function f = duckdb_create_scalar_function();
+      duckdb_scalar_function_set_name(f, "luajit_f");
+      duckdb_scalar_function_set_function(f, f_luajit_f);
+      duckdb_scalar_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE));
+      duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_scalar_function_set_varargs(f, duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE));
+      duckdb_register_scalar_function(conn, f); duckdb_destroy_scalar_function(&f); }
 
-    /* luajit_module() */
-    {
-        duckdb_table_function t = duckdb_create_table_function();
-        duckdb_table_function_set_name(t, "luajit_module");
-        duckdb_table_function_add_named_parameter(t, "mode", duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-        duckdb_table_function_add_named_parameter(t, "source", duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-        duckdb_table_function_add_named_parameter(t, "sql_name", duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-        duckdb_table_function_set_bind(t, mod_bind);
-        duckdb_table_function_set_init(t, mod_init);
-        duckdb_table_function_set_function(t, mod_func);
-        duckdb_register_table_function(conn, t);
-        duckdb_destroy_table_function(&t);
-    }
+    { duckdb_table_function t = duckdb_create_table_function();
+      duckdb_table_function_set_name(t, "luajit_module");
+      duckdb_table_function_add_named_parameter(t, "mode", duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_table_function_add_named_parameter(t, "source", duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_table_function_add_named_parameter(t, "sql_name", duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_table_function_set_bind(t, mod_bind);
+      duckdb_table_function_set_init(t, mod_init);
+      duckdb_table_function_set_function(t, mod_func);
+      duckdb_register_table_function(conn, t); duckdb_destroy_table_function(&t); }
 }
+
+#endif /* !LUAJIT_WASM_STUB */
