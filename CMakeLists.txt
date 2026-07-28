@@ -68,7 +68,11 @@ if(NOT DUCKDB_WASM_EXTENSION)
         IMPORTED_LOCATION ${LUAJIT_LIB}
     )
     target_include_directories(luajit_imported INTERFACE ${LUAJIT_DIR}/src)
-    target_link_libraries(luajit_imported INTERFACE dl m)
+    if(WIN32)
+        target_link_libraries(luajit_imported INTERFACE)
+    else()
+        target_link_libraries(luajit_imported INTERFACE dl m)
+    endif()
     add_dependencies(luajit_imported luajit_runtime)
 endif()
 
