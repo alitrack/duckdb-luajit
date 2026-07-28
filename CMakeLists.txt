@@ -18,10 +18,6 @@ if (DEFINED TARGET_DUCKDB_VERSION_PATCH)
 endif()
 
 add_definitions(-DDUCKDB_EXTENSION_NAME=${EXTENSION_NAME})
-# Suppress incompatible-pointer-types on GCC/Clang (ARM64 ABI mismatch)
-if(NOT MSVC)
-  add_compile_options(-Wno-incompatible-pointer-types)
-endif()
 
 if (DEFINED DUCKDB_EXTENSION_API_VERSION_UNSTABLE)
     add_definitions(-DDUCKDB_EXTENSION_API_VERSION_UNSTABLE=${DUCKDB_EXTENSION_API_VERSION_UNSTABLE})
