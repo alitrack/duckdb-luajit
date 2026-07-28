@@ -24,25 +24,38 @@ if (DEFINED DUCKDB_EXTENSION_API_VERSION_UNSTABLE)
 endif()
 
 ###
-# LuaJIT Configuration
+# LuaJIT — built via its own Makefile as an imported static library
 ###
-option(LUAJIT_EMBEDDED "Build with embedded LuaJIT runtime" ON)
-set(LUAJIT_VERSION "2.1" CACHE STRING "LuaJIT version")
+set(LUAJIT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/LuaJIT)
+set(LUAJIT_LIB ${LUAJIT_DIR}/src/libluajit.a)
+
+# Build LuaJIT using its own Makefile
+add_custom_command(
+    OUTPUT ${LUAJIT_LIB}
+    COMMAND make -C ${LUAJIT_DIR} -j$(nproc) BUILDMODE=static XCFLAGS=-fPIC
+    COMMENT "Building LuaJIT..."
+    WORKING_DIRECTORY ${LUAJIT_DIR}
+)
+
+add_custom_target(luajit_runtime ALL DEPENDS ${LUAJIT_LIB})
+
+# Create an imported library target for LuaJIT
+add_library(luajit_imported STATIC IMPORTED)
+set_target_properties(luajit_imported PROPERTIES
+    IMPORTED_LOCATION ${LUAJIT_LIB}
+)
+target_include_directories(luajit_imported INTERFACE ${LUAJIT_DIR}/src)
+target_link_libraries(luajit_imported INTERFACE dl m)
+add_dependencies(luajit_imported luajit_runtime)
 
 ###
-# Build
+# Build Extension
 ###
 project(${EXTENSION_NAME} LANGUAGES C)
 
-# LuaJIT submodule / third-party
-if(LUAJIT_EMBEDDED)
-    add_subdirectory(third_party/LuaJIT EXCLUDE_FROM_ALL)
-endif()
-
-# Create Extension library
 set(EXTENSION_SOURCES
-        src/luajit_module.c
         src/luajit_entry.c
+        src/luajit_module.c
         src/luajit_bridge.c
 )
 
@@ -56,8 +69,6 @@ endif()
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 set(VISIBILITY_INLINES_HIDDEN ON)
-set(CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE} -s")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -s")
 
 # Include own headers
 target_include_directories(${EXTENSION_NAME} PRIVATE src/include)
@@ -65,7 +76,9 @@ target_include_directories(${EXTENSION_NAME} PRIVATE src/include)
 # Include DuckDB C API headers
 target_include_directories(${EXTENSION_NAME} PRIVATE duckdb_capi)
 
+# Include LuaJIT headers
+target_include_directories(${EXTENSION_NAME} PRIVATE ${LUAJIT_DIR}/src)
+
 # Link LuaJIT
-if(LUAJIT_EMBEDDED)
-    target_link_libraries(${EXTENSION_NAME} PRIVATE luajit)
-endif()
+target_link_libraries(${EXTENSION_NAME} PRIVATE luajit_imported)
+add_dependencies(${EXTENSION_NAME} luajit_runtime)
