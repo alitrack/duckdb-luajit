@@ -400,24 +400,50 @@ static void fjm_map(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector
 /* ── Aggregate UDF: luajit_agg(name, arg) → DOUBLE ── */
 
 static double g_agg_sum = 0.0;
-static int g_agg_count = 0;
+static char *g_agg_udf = NULL;
 
 static idx_t agg_state_size(duckdb_function_info fi) { (void)fi; return 8; }
 static void agg_init(duckdb_function_info fi, duckdb_aggregate_state st) { (void)fi; memset(st, 0, 8); }
+
 static void agg_update(duckdb_function_info fi, duckdb_data_chunk in, duckdb_aggregate_state *states, idx_t nr) {
     (void)fi; (void)states;
+
+    /* Capture UDF name from column 0 */
+    if (!g_agg_udf) {
+        duckdb_vector nv = duckdb_data_chunk_get_vector(in, 0);
+        duckdb_string_t ns = ((duckdb_string_t *)duckdb_vector_get_data(nv))[0];
+        g_agg_udf = strdup(duckdb_string_t_data(&ns));
+    }
+
+    /* Accumulate values from column 1 — bounded by what fits in buffer */
     duckdb_vector cv = duckdb_data_chunk_get_vector(in, 1);
     double *cd = (double *)duckdb_vector_get_data(cv);
-    /* DuckDB may pass chunk with fewer valid rows than data buffer */
-    for (idx_t i = 0; i < nr && i < 5; i++) g_agg_sum += cd[i];
+    idx_t safe_nr = nr > 2048 ? 2048 : nr;
+    for (idx_t i = 0; i < safe_nr; i++) g_agg_sum += cd[i];
 }
 static void agg_combine(duckdb_function_info fi, duckdb_aggregate_state *s, duckdb_aggregate_state *d, idx_t c) { (void)fi; (void)s; (void)d; (void)c; }
 static void agg_destroy(duckdb_function_info fi, duckdb_aggregate_state *states, idx_t count) { (void)fi; (void)states; (void)count; }
 
 static void agg_finalize(duckdb_function_info fi, duckdb_aggregate_state *src, duckdb_vector result, idx_t count, idx_t offset) {
     double *od = (double *)duckdb_vector_get_data(result);
-    od[offset] = g_agg_sum;
-    g_agg_sum = 0.0; g_agg_count = 0; /* reset for next call */
+    double sum = g_agg_sum; char *udf = g_agg_udf;
+    g_agg_sum = 0.0; g_agg_udf = NULL; /* reset immediately */
+
+    L_(); lua_State *L = g_lua;
+    if (udf && L) {
+        lua_getglobal(L, udf);
+        if (lua_isfunction(L, -1)) {
+            lua_pushnumber(L, sum);
+            if (lua_pcall(L, 1, 1, 0) == LUA_OK && lua_isnumber(L, -1))
+                od[offset] = lua_tonumber(L, -1);
+            else
+                { od[offset] = sum; lua_pop(L, 1); goto done; }
+            lua_pop(L, 1);
+        } else { lua_pop(L, 1); od[offset] = sum; }
+    } else od[offset] = sum;
+
+done:
+    free(udf);
 }
 
 /* ── luajit_table: Lua table function ── */
