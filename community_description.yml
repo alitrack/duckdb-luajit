@@ -11,7 +11,7 @@ extension:
 
 repo:
   github: alitrack/luajit
-  ref: 10ac8ae24baa8ba65ef01380a2a469a60f724a22
+  ref: refs/tags/v1.0.0
 
 docs:
   hello_world: |

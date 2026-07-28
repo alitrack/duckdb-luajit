@@ -1,6 +1,6 @@
 name: luajit
-version: 0.16.0
-description: "LuaJIT UDFs — 10 scalar (incl. batch @1.0x native), 1 agg, 1 table, save/load/auto-load"
+version: 1.0.0
+description: "LuaJIT UDFs — 12 functions, JIT-compiled, GROUP BY, batch @1.0x native, save/load/auto-load"
 license: MIT
 maintainers:
   - alitrack
