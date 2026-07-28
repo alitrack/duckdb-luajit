@@ -240,6 +240,42 @@ static void mod_init(duckdb_init_info info) {
     /* ── info mode ── */
     if(!strcmp(m,"info")){d->ok=true;d->phase="info";return;}
 
+    /* ── inspect mode: show function details ── */
+    if(!strcmp(m,"inspect")){
+        if(!d->sql_name){d->msg=strdup("need sql_name");return;}
+        L_();lua_State *L=g_lua;
+        lua_getglobal(L,d->sql_name);
+        if(!lua_isfunction(L,-1)){d->msg=strdup("not found");lua_pop(L,1);return;}
+        /* Probe arity */
+        int np=0,isvararg=0;const char *src="?";
+        lua_getglobal(L,"debug");lua_getfield(L,-1,"getinfo");
+        lua_pushvalue(L,-3);lua_pushstring(L,"uS");
+        if(lua_pcall(L,2,1,0)==LUA_OK&&lua_istable(L,-1)){
+            lua_getfield(L,-1,"nparams");np=(int)lua_tointeger(L,-1);lua_pop(L,1);
+            lua_getfield(L,-1,"isvararg");isvararg=lua_toboolean(L,-1);lua_pop(L,1);
+            lua_getfield(L,-1,"source");if(lua_isstring(L,-1))src=lua_tostring(L,-1);lua_pop(L,1);
+        }
+        lua_pop(L,2);
+        /* Guess return type by calling with zero/nil args */
+        const char *ret="VARCHAR";
+        lua_pushvalue(L,-1); /* dup function */
+        for(int i=0;i<np;i++)lua_pushinteger(L,0);
+        if(lua_pcall(L,np,1,0)==LUA_OK){
+            if(lua_isboolean(L,-1))ret="BOOLEAN";
+            else if(lua_isnumber(L,-1)){
+                lua_Number n=lua_tonumber(L,-1);
+                ret=(n==(lua_Number)(lua_Integer)n)?"BIGINT":"DOUBLE";
+            }
+            lua_pop(L,1);
+        }else{lua_pop(L,1);}
+        lua_pop(L,1);
+        char buf[256];
+        snprintf(buf,sizeof(buf),"%s(%d arg%s%s) -> %s (source: %s)",d->sql_name,np,
+            np!=1?"s":"",isvararg?", ...":"",ret,src);
+        d->ok=true;d->phase="inspect";d->sql_name=strdup(d->sql_name);d->detail=strdup(buf);
+        return;
+    }
+
     /* ── list mode: enumerate compiled UDFs ── */
     if(!strcmp(m,"list")){
         L_();lua_State *L=g_lua;
@@ -315,6 +351,54 @@ static void mod_init(duckdb_init_info info) {
         for(int i=0;i<nargs;i++)off+=snprintf(buf+off,sizeof(buf)-off,", x%d",i+1);
         snprintf(buf+off,sizeof(buf)-off,")");
         d->ok=true;d->phase="macro";d->detail=strdup(buf);d->sql_name=strdup(d->sql_name);
+        return;
+    }
+
+    /* ── quick_compile: compile + auto-probe return type + auto-macro ── */
+    if(!strcmp(m,"quick_compile")){
+        if(!d->source||!d->sql_name){d->msg=strdup("need source+sql_name for quick_compile");return;}
+        L_();lua_State *L=g_lua;
+        if(!L){d->msg=strdup("no Lua");return;}
+        d->phase="quick_compile";
+        /* Step 1: compile source */
+        if(luaL_loadstring(L,d->source)!=LUA_OK)
+            {d->msg=strdup(lua_tostring(L,-1));lua_pop(L,1);return;}
+        if(lua_pcall(L,0,1,0)!=LUA_OK)
+            {d->msg=strdup(lua_tostring(L,-1));lua_pop(L,1);return;}
+        if(!lua_isfunction(L,-1))
+            {d->msg=strdup("must return a function");lua_pop(L,1);return;}
+        /* Step 2: probe arity */
+        int np=0;
+        lua_pushvalue(L,-1);
+        lua_getglobal(L,"debug");lua_getfield(L,-1,"getinfo");
+        lua_pushvalue(L,-3);lua_pushstring(L,"u");
+        if(lua_pcall(L,2,1,0)==LUA_OK&&lua_istable(L,-1))
+            {lua_getfield(L,-1,"nparams");np=(int)lua_tointeger(L,-1);lua_pop(L,1);}
+        lua_pop(L,2);lua_pop(L,1);
+        /* Step 3: probe return type by calling with zero ints */
+        const char *var="v"; /* v=f(0,...) → VARCHAR */
+        lua_pushvalue(L,-1);
+        for(int i=0;i<np;i++)lua_pushinteger(L,0);
+        if(lua_pcall(L,np,1,0)==LUA_OK){
+            if(lua_isboolean(L,-1))var="b";
+            else if(lua_isnumber(L,-1)){
+                lua_Number n=lua_tonumber(L,-1);
+                var=(n==(lua_Number)(lua_Integer)n)?"i":"f";
+            }
+            lua_pop(L,1);
+        }else{lua_pop(L,1);}
+        /* Step 4: store as Lua global */
+        lua_setglobal(L,d->sql_name);
+        /* Step 5: generate macro DDL */
+        const char *fn=*var=='i'?"luajit_i":*var=='f'?"luajit_f":*var=='b'?"luajit_b":"luajit";
+        char buf[2048];int off=snprintf(buf,sizeof(buf),"CREATE OR REPLACE MACRO %s(",d->sql_name);
+        for(int i=0;i<np;i++)off+=snprintf(buf+off,sizeof(buf)-off,"%sx%d",i>0?", ":"",i+1);
+        off+=snprintf(buf+off,sizeof(buf)-off,") AS %s('",fn);
+        off+=snprintf(buf+off,sizeof(buf)-off,"%s'",d->sql_name);
+        for(int i=0;i<np;i++)off+=snprintf(buf+off,sizeof(buf)-off,", x%d",i+1);
+        snprintf(buf+off,sizeof(buf)-off,")");
+
+        d->ok=true;d->sql_name=strdup(d->sql_name);d->detail=strdup(buf);
         return;
     }
 
