@@ -980,10 +980,7 @@ void luajit_register_module_functions(
       duckdb_aggregate_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
       duckdb_aggregate_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE));
       duckdb_aggregate_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE));
-      duckdb_aggregate_function_set_functions(f,
-        (duckdb_aggregate_state_size_t)agg_state_size,
-        agg_init, agg_update,
-        (duckdb_aggregate_combine_t)agg_combine, agg_finalize);
+      duckdb_aggregate_function_set_functions(f, agg_state_size, agg_init, agg_update, agg_combine, agg_finalize);
       { int *es = (int *)duckdb_malloc(sizeof(int));
         *es = 42;
         duckdb_aggregate_function_set_extra_info(f, es, free); }
