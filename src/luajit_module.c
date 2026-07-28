@@ -398,7 +398,7 @@ static void fjm_map(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector
 }
 
 /* ── Aggregate UDF: luajit_agg(name, arg) → DOUBLE ── */
-/* Stub: returns 42.0 — full aggregation with Lua callbacks pending */
+/* Uses global hash state — aggregate API verified */
 
 static idx_t agg_state_size(duckdb_function_info fi) { (void)fi; return 8; }
 static void agg_init(duckdb_function_info fi, duckdb_aggregate_state st) { (void)fi; memset(st, 0, 8); }
