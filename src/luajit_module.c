@@ -412,6 +412,76 @@ static void agg_finalize(duckdb_function_info fi, duckdb_aggregate_state *src, d
     for (idx_t j = 0; j < count; j++) od[offset + j] = 42.0;
 }
 
+/* ── luajit_table: Lua table function ── */
+
+typedef struct { char *source, *sql_name; } tbt_data_t;
+typedef struct { int ref, cur_row, total; bool done; } tbt_state_t;
+
+static void tbt_bind(duckdb_bind_info info) {
+    tbt_data_t *d = (tbt_data_t *)duckdb_malloc(sizeof(tbt_data_t));
+    memset(d, 0, sizeof(*d));
+    /* Read positional parameter 0 as source */
+    duckdb_value v = duckdb_bind_get_parameter(info, 0);
+    if (v) { d->source = strdup(duckdb_get_varchar(v)); duckdb_destroy_value(&v); }
+    duckdb_bind_add_result_column(info, "row_idx", duckdb_create_logical_type(DUCKDB_TYPE_BIGINT));
+    duckdb_bind_add_result_column(info, "val", duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+    duckdb_bind_set_bind_data(info, d, free);
+}
+
+static void tbt_init(duckdb_init_info info) {
+    tbt_data_t *d = (tbt_data_t *)duckdb_init_get_bind_data(info);
+    tbt_state_t *s = (tbt_state_t *)duckdb_malloc(sizeof(tbt_state_t));
+    memset(s, 0, sizeof(*s));
+    duckdb_init_set_init_data(info, s, free);
+    if (!d || !d->source) return;
+
+    L_(); lua_State *L = g_lua; if (!L) return;
+    int top0 = lua_gettop(L);
+
+    /* Try as compiled UDF name first, then as inline source */
+    lua_getglobal(L, d->source);
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        if (luaL_loadstring(L, d->source) != LUA_OK) { lua_pop(L, 1); goto cleanup; }
+        if (lua_pcall(L, 0, 1, 0) != LUA_OK) { lua_pop(L, 1); goto cleanup; }
+    } else {
+        if (lua_pcall(L, 0, 1, 0) != LUA_OK) { lua_pop(L, 1); goto cleanup; }
+    }
+
+    if (!lua_istable(L, -1)) goto cleanup;
+    s->total = (int)lua_objlen(L, -1);
+    s->ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    lua_settop(L, top0);
+    return;
+cleanup:
+    lua_settop(L, top0);
+}
+
+static void tbt_func(duckdb_function_info fi, duckdb_data_chunk out) {
+    tbt_state_t *s = (tbt_state_t *)duckdb_function_get_init_data(fi);
+    if (!s || s->done) { duckdb_data_chunk_set_size(out, 0); return; }
+    L_(); lua_State *L = g_lua;
+    if (!L || s->ref < 0) { duckdb_data_chunk_set_size(out, 0); s->done = true; return; }
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, s->ref);
+    if (!lua_istable(L, -1)) { lua_pop(L, 1); duckdb_data_chunk_set_size(out, 0); s->done = true; return; }
+
+    idx_t sz = duckdb_data_chunk_get_size(out), em = 0;
+    int64_t *oi = (int64_t *)duckdb_vector_get_data(duckdb_data_chunk_get_vector(out, 0));
+    for (int r = s->cur_row; r < s->total && em < sz; r++) {
+        lua_rawgeti(L, -1, r + 1);
+        if (lua_isnil(L, -1)) { lua_pop(L, 1); continue; }
+        to_str(L);
+        oi[em] = (int64_t)(r + 1);
+        duckdb_vector_assign_string_element(duckdb_data_chunk_get_vector(out, 1), em, lua_tostring(L, -1));
+        lua_pop(L, 1); em++;
+    }
+    lua_pop(L, 1);
+    duckdb_data_chunk_set_size(out, em);
+    s->cur_row += (int)em;
+    if (s->cur_row >= s->total) s->done = true;
+}
+
 /* ── luajit_module() table function ── */
 
 typedef struct {
@@ -714,6 +784,18 @@ void luajit_register_module_functions(
     #undef REG
     #undef VARGS
     #undef END
+
+    /* ── luajit_table ── */
+    { duckdb_table_function t = duckdb_create_table_function();
+      duckdb_table_function_set_name(t, "luajit_table");
+      duckdb_table_function_add_parameter(t, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_table_function_set_bind(t, tbt_bind);
+      duckdb_table_function_set_init(t, tbt_init);
+      duckdb_table_function_set_function(t, tbt_func);
+      duckdb_register_table_function(conn, t);
+      duckdb_destroy_table_function(&t); }
+
+    /* ── luajit_module ── */
 
     duckdb_table_function t=duckdb_create_table_function();
     duckdb_table_function_set_name(t,"luajit_module");
