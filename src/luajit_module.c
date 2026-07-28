@@ -359,8 +359,10 @@ static void push_map_to_lua(lua_State *L, duckdb_vector mv, idx_t r) {
     lua_createtable(L, 0, (int)len);
     for (uint64_t i = 0; i < len; i++) {
         /* push key */
-        if (kt == DUCKDB_TYPE_BIGINT || kt == DUCKDB_TYPE_INTEGER)
+        if (kt == DUCKDB_TYPE_BIGINT)
             lua_pushinteger(L, ((int64_t*)duckdb_vector_get_data(key_vec))[off + i]);
+        else if (kt == DUCKDB_TYPE_INTEGER || kt == DUCKDB_TYPE_SMALLINT || kt == DUCKDB_TYPE_TINYINT)
+            lua_pushinteger(L, ((int32_t*)duckdb_vector_get_data(key_vec))[off + i]);
         else if (kt == DUCKDB_TYPE_VARCHAR) {
             duckdb_string_t s = ((duckdb_string_t*)duckdb_vector_get_data(key_vec))[off + i];
             lua_pushlstring(L, duckdb_string_t_data(&s), duckdb_string_t_length(s));
@@ -368,8 +370,10 @@ static void push_map_to_lua(lua_State *L, duckdb_vector mv, idx_t r) {
         /* push value */
         if (vt == DUCKDB_TYPE_DOUBLE || vt == DUCKDB_TYPE_FLOAT)
             lua_pushnumber(L, ((double*)duckdb_vector_get_data(val_vec))[off + i]);
-        else if (vt == DUCKDB_TYPE_BIGINT || vt == DUCKDB_TYPE_INTEGER)
+        else if (vt == DUCKDB_TYPE_BIGINT)
             lua_pushinteger(L, ((int64_t*)duckdb_vector_get_data(val_vec))[off + i]);
+        else if (vt == DUCKDB_TYPE_INTEGER || vt == DUCKDB_TYPE_SMALLINT || vt == DUCKDB_TYPE_TINYINT)
+            lua_pushinteger(L, ((int32_t*)duckdb_vector_get_data(val_vec))[off + i]);
         else if (vt == DUCKDB_TYPE_VARCHAR) {
             duckdb_string_t s = ((duckdb_string_t*)duckdb_vector_get_data(val_vec))[off + i];
             lua_pushlstring(L, duckdb_string_t_data(&s), duckdb_string_t_length(s));
