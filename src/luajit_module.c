@@ -399,6 +399,33 @@ static void fjm_map(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector
 
 /* ── Aggregate UDF: luajit_agg(name, arg) → DOUBLE ── */
 
+/* Shared load-from-file helper (used by both mode='load' and auto-load) */
+static int load_udfs_from_file(const char *path) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) return 0;
+    L_(); lua_State *L = g_lua;
+    if (!L) { fclose(fp); return 0; }
+
+    int loaded = 0;
+    char line[16384];
+    while (fgets(line, sizeof(line), fp)) {
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = 0;
+        char *name = line, *source = tab + 1;
+        size_t sl = strlen(source);
+        while (sl > 0 && (source[sl-1] == '\n' || source[sl-1] == '\r')) source[--sl] = 0;
+        if (sl == 0 || !strcmp(source, "?")) continue;
+        if (luaL_loadstring(L, source) != LUA_OK) { lua_pop(L, 1); continue; }
+        if (lua_pcall(L, 0, 1, 0) != LUA_OK) { lua_pop(L, 1); continue; }
+        if (!lua_isfunction(L, -1)) { lua_pop(L, 1); continue; }
+        lua_setglobal(L, name);
+        loaded++;
+    }
+    fclose(fp);
+    return loaded;
+}
+
 #define AGG_MAX_GROUPS 256
 typedef struct {
     uintptr_t key;       /* state pointer as group ID */
@@ -712,33 +739,10 @@ static void mod_init(duckdb_init_info info) {
         return;
     }
 
-    /* ── load mode: restore UDFs from file (name\\tsource per line) ── */
+    /* ── load mode: restore UDFs from file ── */
     if(!strcmp(m,"load")){
         const char *path = d->source ? d->source : "luajit_udfs.txt";
-        FILE *fp=fopen(path,"r");
-        if(!fp){d->msg=strdup("file not found");return;}
-
-        L_();lua_State *L=g_lua;
-        if(!L){fclose(fp);d->msg=strdup("no Lua");return;}
-
-        int loaded=0;
-        char line[16384];
-        while(fgets(line,sizeof(line),fp)){
-            char *tab=strchr(line,'\t');
-            if(!tab)continue;*tab=0;
-            char *name=line,*source=tab+1;
-            /* trim trailing newline */
-            size_t sl=strlen(source);
-            while(sl>0&&(source[sl-1]=='\n'||source[sl-1]=='\r'))source[--sl]=0;
-
-            if(strlen(source)==0||!strcmp(source,"?"))continue;
-            if(luaL_loadstring(L,source)!=LUA_OK){lua_pop(L,1);continue;}
-            if(lua_pcall(L,0,1,0)!=LUA_OK){lua_pop(L,1);continue;}
-            if(!lua_isfunction(L,-1)){lua_pop(L,1);continue;}
-            lua_setglobal(L,name);loaded++;
-        }
-        fclose(fp);
-
+        int loaded = load_udfs_from_file(path);
         d->ok=true;d->phase="load";
         char mbuf[128];snprintf(mbuf,sizeof(mbuf),"loaded %d UDFs from %s",loaded,path);
         d->msg=strdup(mbuf);
@@ -965,6 +969,9 @@ void luajit_register_module_functions(
     duckdb_table_function_set_function(t,mod_func);
     duckdb_register_table_function(conn,t);
     duckdb_destroy_table_function(&t);
+
+    /* Auto-load UDFs from default file on extension init */
+    load_udfs_from_file("luajit_udfs.txt");
 }
 
 #endif /* !LUAJIT_WASM_STUB */
