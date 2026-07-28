@@ -1,0 +1,6 @@
+name: luajit
+version: 0.1.0
+description: DuckDB extension for in-process JIT-compiled Lua UDFs via LuaJIT — self-contained, cross-platform
+license: MIT
+maintainers:
+  - alitrack
