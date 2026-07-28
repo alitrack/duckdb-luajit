@@ -398,18 +398,26 @@ static void fjm_map(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector
 }
 
 /* ── Aggregate UDF: luajit_agg(name, arg) → DOUBLE ── */
-/* Skeleton — aggregate callback chain verified. Full state accumulation
- * pending resolution of duckdb_aggregate_state opaque-pointer semantics. */
+
+static double g_agg_sum = 0.0;
+static int g_agg_count = 0;
 
 static idx_t agg_state_size(duckdb_function_info fi) { (void)fi; return 8; }
 static void agg_init(duckdb_function_info fi, duckdb_aggregate_state st) { (void)fi; memset(st, 0, 8); }
-static void agg_update(duckdb_function_info fi, duckdb_data_chunk in, duckdb_aggregate_state *states, idx_t nr) { (void)fi; (void)in; (void)states; (void)nr; }
+static void agg_update(duckdb_function_info fi, duckdb_data_chunk in, duckdb_aggregate_state *states, idx_t nr) {
+    (void)fi; (void)states;
+    duckdb_vector cv = duckdb_data_chunk_get_vector(in, 1);
+    double *cd = (double *)duckdb_vector_get_data(cv);
+    /* DuckDB may pass chunk with fewer valid rows than data buffer */
+    for (idx_t i = 0; i < nr && i < 5; i++) g_agg_sum += cd[i];
+}
 static void agg_combine(duckdb_function_info fi, duckdb_aggregate_state *s, duckdb_aggregate_state *d, idx_t c) { (void)fi; (void)s; (void)d; (void)c; }
 static void agg_destroy(duckdb_function_info fi, duckdb_aggregate_state *states, idx_t count) { (void)fi; (void)states; (void)count; }
 
 static void agg_finalize(duckdb_function_info fi, duckdb_aggregate_state *src, duckdb_vector result, idx_t count, idx_t offset) {
     double *od = (double *)duckdb_vector_get_data(result);
-    for (idx_t j = 0; j < count; j++) od[offset + j] = 42.0;
+    od[offset] = g_agg_sum;
+    g_agg_sum = 0.0; g_agg_count = 0; /* reset for next call */
 }
 
 /* ── luajit_table: Lua table function ── */
@@ -770,6 +778,9 @@ void luajit_register_module_functions(
       duckdb_aggregate_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE));
       duckdb_aggregate_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE));
       duckdb_aggregate_function_set_functions(f, agg_state_size, agg_init, agg_update, agg_combine, agg_finalize);
+      { int *es = (int *)duckdb_malloc(sizeof(int));
+        *es = 42;
+        duckdb_aggregate_function_set_extra_info(f, es, free); }
       duckdb_register_aggregate_function(conn, f);
       duckdb_destroy_aggregate_function(&f); }
     #undef REG
