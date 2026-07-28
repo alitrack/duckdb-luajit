@@ -1,4 +1,4 @@
-# luajit — DuckDB LuaJIT UDF Extension  v0.11
+# luajit — DuckDB LuaJIT UDF Extension  v0.12
 
 Self-contained DuckDB extension for Lua expressions, JIT-compiled UDFs, and nested type bridges via LuaJIT.
 

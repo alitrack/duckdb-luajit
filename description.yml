@@ -1,6 +1,6 @@
 name: luajit
-version: 0.11.0
-description: In-process JIT-compiled Lua UDFs via LuaJIT — 9 scalar, 1 aggregate, 1 table, 8 module modes, ~700KB.
+version: 0.12.0
+description: In-process JIT-compiled Lua UDFs — 9 scalar, 1 aggregate (multi-row), 1 table, 8 module modes, ~700KB.
 license: MIT
 maintainers:
   - alitrack
