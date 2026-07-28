@@ -399,7 +399,9 @@ static void fjm_map(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector
 
 /* ── Aggregate UDF: luajit_agg(name, arg) → DOUBLE ── */
 
-static double g_agg_sum = 0.0;
+static double *g_agg_vals = NULL;
+static idx_t g_agg_len = 0;
+static idx_t g_agg_cap = 0;
 static char *g_agg_udf = NULL;
 
 static idx_t agg_state_size(duckdb_function_info fi) { (void)fi; return 8; }
@@ -415,34 +417,47 @@ static void agg_update(duckdb_function_info fi, duckdb_data_chunk in, duckdb_agg
         g_agg_udf = strdup(duckdb_string_t_data(&ns));
     }
 
-    /* Accumulate values from column 1 — bounded by what fits in buffer */
+    /* Accumulate values — use chunk size, not nr (nr may be larger) */
     duckdb_vector cv = duckdb_data_chunk_get_vector(in, 1);
     double *cd = (double *)duckdb_vector_get_data(cv);
-    idx_t safe_nr = nr > 2048 ? 2048 : nr;
-    for (idx_t i = 0; i < safe_nr; i++) g_agg_sum += cd[i];
+    uint64_t *validity = duckdb_vector_get_validity(cv);
+    idx_t chunk_nr = duckdb_data_chunk_get_size(in);
+
+    for (idx_t i = 0; i < chunk_nr; i++) {
+        if (validity && !(validity[i / 64] & (1ULL << (i % 64)))) continue;
+        if (g_agg_len + 1 > g_agg_cap) {
+            g_agg_cap = g_agg_cap ? g_agg_cap * 2 : 1024;
+            g_agg_vals = (double *)realloc(g_agg_vals, g_agg_cap * sizeof(double));
+        }
+        g_agg_vals[g_agg_len++] = cd[i];
+    }
 }
 static void agg_combine(duckdb_function_info fi, duckdb_aggregate_state *s, duckdb_aggregate_state *d, idx_t c) { (void)fi; (void)s; (void)d; (void)c; }
 static void agg_destroy(duckdb_function_info fi, duckdb_aggregate_state *states, idx_t count) { (void)fi; (void)states; (void)count; }
 
 static void agg_finalize(duckdb_function_info fi, duckdb_aggregate_state *src, duckdb_vector result, idx_t count, idx_t offset) {
     double *od = (double *)duckdb_vector_get_data(result);
-    double sum = g_agg_sum; char *udf = g_agg_udf;
-    g_agg_sum = 0.0; g_agg_udf = NULL; /* reset immediately */
+    double *vals = g_agg_vals; idx_t len = g_agg_len; char *udf = g_agg_udf;
+    g_agg_vals = NULL; g_agg_len = g_agg_cap = 0; g_agg_udf = NULL;
 
     L_(); lua_State *L = g_lua;
-    if (udf && L) {
-        lua_getglobal(L, udf);
-        if (lua_isfunction(L, -1)) {
-            lua_pushnumber(L, sum);
-            if (lua_pcall(L, 1, 1, 0) == LUA_OK && lua_isnumber(L, -1))
-                od[offset] = lua_tonumber(L, -1);
-            else
-                { od[offset] = sum; lua_pop(L, 1); goto done; }
-            lua_pop(L, 1);
-        } else { lua_pop(L, 1); od[offset] = sum; }
-    } else od[offset] = sum;
+    if (!udf || !L) { od[offset] = 0.0; free(udf); return; }
 
-done:
+    lua_getglobal(L, udf);
+    if (!lua_isfunction(L, -1)) { lua_pop(L, 1); od[offset] = 0.0; free(udf); return; }
+
+    /* Build Lua table {val[1], val[2], ...} */
+    lua_createtable(L, (int)len, 0);
+    for (idx_t i = 0; i < len; i++)
+        { lua_pushnumber(L, vals[i]); lua_rawseti(L, -2, (int)(i + 1)); }
+
+    if (lua_pcall(L, 1, 1, 0) == LUA_OK && lua_isnumber(L, -1))
+        od[offset] = lua_tonumber(L, -1);
+    else
+        { od[offset] = 0.0; lua_pop(L, 1); }
+    lua_pop(L, 1);
+
+    free(vals);
     free(udf);
 }
 
