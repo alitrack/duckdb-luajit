@@ -56,7 +56,6 @@ project(${EXTENSION_NAME} LANGUAGES C)
 set(EXTENSION_SOURCES
         src/luajit_entry.c
         src/luajit_module.c
-        src/luajit_bridge.c
 )
 
 if (DUCKDB_WASM_EXTENSION)

@@ -1,5 +1,5 @@
 /*
- * luajit — DuckDB LuaJIT UDF Extension
+ * luajit — persistent connection for UDF registration
  * SPDX-License-Identifier: MIT
  */
 
@@ -13,6 +13,6 @@ DUCKDB_EXTENSION_ENTRYPOINT(
     duckdb_extension_info info,
     struct duckdb_extension_access *access)
 {
-	luajit_register_module_functions(connection);
+	luajit_register_module_functions(connection, info, access);
 	return true;
 }

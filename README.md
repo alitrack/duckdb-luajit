@@ -2,80 +2,49 @@
 
 DuckDB community extension for in-process JIT-compiled Lua UDFs via LuaJIT.
 
-**Self-contained. Cross-platform. Sandbox-aware.**
-
-## Quick Start
+**Self-contained. Cross-platform. Fast.**
 
 ```sql
 INSTALL luajit FROM community;
 LOAD luajit;
 
--- Compile and register a Lua function as a SQL UDF
-SELECT ok, mode, code FROM luajit_module(
-    mode := 'quick_compile',
-    source := 'return function(a, b) return a + b end',
-    sql_name := 'lua_add',
-    return_type := 'i64',
-    arg_types := ['i64', 'i64']
+-- Inline evaluation
+SELECT luajit('return 1 + 2');                    -- '3'
+SELECT luajit('return _VERSION');                  -- 'Lua 5.1'
+
+-- Register named UDFs
+SELECT ok FROM luajit_module(
+    mode := 'compile',
+    source := 'return function(a, b) return tostring(tonumber(a) + tonumber(b)) end',
+    sql_name := 'lua_add'
 );
+SELECT lua_add('3', '4');                          -- '7'
 
--- Call the registered UDF
-SELECT lua_add(1, 2) AS result;
+-- Use with table data
+SELECT v, lua_mul10(v) FROM my_table;
 ```
 
-## Design Principles
+## Design
 
-- **LuaJIT FFI** for zero-overhead DuckDB C API interop — no C wrapper codegen needed
-- **Self-contained** — LuaJIT runtime baked into the extension binary
-- **Cross-platform** — Linux (amd64/arm64), macOS (amd64/arm64), Windows, WASM
-- **Sandbox-friendly** — Lua's built-in environment isolation beats raw C
-- **Type bridge** — full DuckDB type system mapped to Lua/LuaJIT FFI types
+- **LuaJIT** (MIT-licensed fork of Lua 5.1): trace-based JIT compiles hot paths to machine code
+- **Self-contained**: LuaJIT runtime statically linked, ~700KB extension binary
+- **Cross-platform**: Linux/macOS/Windows/WASM — LuaJIT is pure ANSI C
 
-## Platform Support
+## API
 
-| Platform | Status |
-|----------|--------|
-| linux_amd64 | ✅ |
-| linux_arm64 | ✅ |
-| osx_amd64 | ✅ |
-| osx_arm64 | ✅ |
-| windows_amd64 | ✅ |
-| wasm_mvp | ✅ |
-| wasm_eh | ✅ |
-| wasm_threads | ✅ |
-
-## Architecture
-
-```
-SQL: luajit_module(...)
-     ↓
-luajit_module.c (control plane)
-     ├── session staging (source, includes, bind management)
-     ├── type signature parsing (SQL types → LuaJIT FFI types)
-     ├── LuaJIT FFI bridge (direct DuckDB C API calls, no C glue code)
-     ├── function registration via duckdb extension API
-     └── luajit_execute_udf (runtime vector marshaling)
-```
-
-## Comparison
-
-| Feature | DuckTinyCC (C/TCC) | luajit (LuaJIT) |
-|---------|-------------------|-----------------|
-| Language | C | Lua |
-| Compilation | libtcc → machine code | LuaJIT trace → asm |
-| Windows | ❌ | ✅ |
-| WASM | ❌ | ✅ |
-| Sandbox | ❌ (bare metal) | ✅ (env isolation) |
-| FFI bridge | Codegen wrapper C | Direct ffi.C.* calls |
-| Type bridge LOC | ~3000 | ~500 (ffi eliminates most) |
+| Function | Type | Description |
+|----------|------|-------------|
+| `luajit(expr)` | scalar → VARCHAR | Evaluate Lua expression inline |
+| `luajit_module(...)` | table function | Compile and register named Lua UDFs |
 
 ## Build
 
 ```sh
+git clone --recursive https://github.com/alitrack/luajit.git
+cd luajit
+# Clone LuaJIT into third_party/LuaJIT (from https://github.com/LuaJIT/LuaJIT)
 make configure
-make debug
 make release
-make test_debug
 make test_release
 ```
 
