@@ -33,7 +33,7 @@ if(NOT DUCKDB_WASM_EXTENSION)
 
     add_custom_command(
         OUTPUT ${LUAJIT_LIB}
-        COMMAND make -C ${LUAJIT_DIR} -j$(nproc) BUILDMODE=static XCFLAGS=-fPIC
+        COMMAND make -C ${LUAJIT_DIR} -j$$(nproc) BUILDMODE=static XCFLAGS=-fPIC
         COMMENT "Building LuaJIT..."
         WORKING_DIRECTORY ${LUAJIT_DIR}
     )
