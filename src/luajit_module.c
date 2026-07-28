@@ -156,6 +156,48 @@ static void fjf(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     }
 }
 
+/* luajit_v(name, ...DOUBLE) → DOUBLE  — chunk-batched: 1 Lua call per chunk */
+static void fjv(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
+    L_(); lua_State *L = g_lua;
+    if (!L) return;
+    idx_t nr = duckdb_data_chunk_get_size(in);
+    idx_t nc = duckdb_data_chunk_get_column_count(in);
+    if (nr == 0 || nc < 2) return;
+
+    double *od = (double *)duckdb_vector_get_data(out);
+
+    /* Resolve UDF name (from first row's column 0) */
+    if (!resolve_udf(L, duckdb_data_chunk_get_vector(in, 0), 0)) return;
+    if (!lua_isfunction(L, -1)) { lua_pop(L, 1); return; }
+
+    /* Build one Lua table per arg column: {val_1, val_2, ..., val_nr} */
+    int nargs = (int)(nc - 1);
+    for (int c = 1; c < (int)nc; c++) {
+        lua_createtable(L, (int)nr, 0);
+        duckdb_vector v = duckdb_data_chunk_get_vector(in, (idx_t)c);
+        double *d = (double *)duckdb_vector_get_data(v);
+        for (idx_t r = 0; r < nr; r++) {
+            lua_pushnumber(L, d[r]);
+            lua_rawseti(L, -2, (int)(r + 1));
+        }
+    }
+
+    /* Call UDF(t1, t2, ...) once per chunk — func already at bottom */
+    if (lua_pcall(L, nargs, 1, 0) != LUA_OK || !lua_istable(L, -1)) {
+        lua_pop(L, lua_gettop(L)); /* clear stack */
+        return;
+    }
+
+    /* Unpack result table → output vector */
+    idx_t rlen = (idx_t)lua_objlen(L, -1);
+    for (idx_t r = 0; r < nr && r < rlen; r++) {
+        lua_rawgeti(L, -1, (int)(r + 1));
+        od[r] = lua_isnumber(L, -1) ? lua_tonumber(L, -1) : 0.0;
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+}
+
 /* luajit_b(name, ...BOOLEAN) → BOOLEAN */
 static void fjb(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
     L_();lua_State *L=g_lua;if(!L)return;
@@ -896,6 +938,7 @@ void luajit_register_module_functions(
     REG("luajit_f", fjf, DUCKDB_TYPE_DOUBLE)  VARGS(DUCKDB_TYPE_DOUBLE)  END();
     REG("luajit_b", fjb, DUCKDB_TYPE_BOOLEAN) VARGS(DUCKDB_TYPE_BOOLEAN) END();
     REG("luajit_m", fjm, DUCKDB_TYPE_DOUBLE)  VARGS(DUCKDB_TYPE_DOUBLE)  END();
+    REG("luajit_v", fjv, DUCKDB_TYPE_DOUBLE)  VARGS(DUCKDB_TYPE_DOUBLE)  END();
 
     /* luajit_l: LIST(BIGINT) args → LIST(DOUBLE) return */
     { duckdb_scalar_function f = duckdb_create_scalar_function();
