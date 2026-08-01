@@ -29,6 +29,41 @@ void luajit_register_module_functions(
 #include <stdlib.h>
 #include <stdint.h>
 
+/* ── Thread safety: single global Lua state, guarded by a recursive mutex ──
+ * DuckDB executes UDFs in parallel across threads; every Lua access must be
+ * serialized. Recursive so _duckdb_call → duckdb_query → luajit UDF can re-enter.
+ */
+#ifdef _WIN32
+#include <windows.h>
+static CRITICAL_SECTION g_lua_lock;
+static void lua_lock_init(void) { InitializeCriticalSection(&g_lua_lock); }
+#define LUA_LOCK()   EnterCriticalSection(&g_lua_lock)
+#define LUA_UNLOCK() LeaveCriticalSection(&g_lua_lock)
+#else
+#include <pthread.h>
+static pthread_mutex_t g_lua_lock;
+static void lua_lock_init(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_lua_lock, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+#define LUA_LOCK()   pthread_mutex_lock(&g_lua_lock)
+#define LUA_UNLOCK() pthread_mutex_unlock(&g_lua_lock)
+#endif
+
+/* ── Thread-safety guard for executor bodies ──
+ * Usage:
+ *   static void fn(...) {
+ *       LUA_BEGIN();              // locks, ensures g_lua, goto lua_cleanup if NULL
+ *       ...                       // every early return becomes: goto lua_cleanup;
+ *       LUA_CLEANUP();            // label + unlock
+ *   }
+ */
+#define LUA_BEGIN()  LUA_LOCK(); L_(); lua_State *L = g_lua; if (!L) goto lua_cleanup;
+#define LUA_CLEANUP() lua_cleanup: LUA_UNLOCK()
+
 static lua_State *g_lua = NULL;
 static duckdb_connection g_conn = NULL;
 
@@ -93,7 +128,7 @@ static void to_str(lua_State *L) {
 /* ── luajit(str) → VARCHAR ── */
 
 static void fj(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
-    L_();lua_State *L=g_lua;if(!L)return;
+    LUA_BEGIN();
     idx_t n=duckdb_data_chunk_get_size(in);
     for(idx_t r=0;r<n;r++){
         duckdb_vector sv=duckdb_data_chunk_get_vector(in,0);
@@ -107,6 +142,7 @@ static void fj(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out)
         else{to_str(L);duckdb_vector_assign_string_element(out,r,lua_tostring(L,-1));lua_pop(L,1);}
         lua_pop(L,1);
     }
+    LUA_CLEANUP();
 }
 
 /* ── UDF executors ── */
@@ -122,7 +158,7 @@ static int resolve_udf(lua_State *L, duckdb_vector nv, idx_t r) {
 
 /* luajit_i(name, ...BIGINT) → BIGINT */
 static void fji(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
-    L_();lua_State *L=g_lua;if(!L)return;
+    LUA_BEGIN();
     idx_t nr=duckdb_data_chunk_get_size(in),nc=duckdb_data_chunk_get_column_count(in);
     int64_t*od=(int64_t*)duckdb_vector_get_data(out);
     for(idx_t r=0;r<nr;r++){
@@ -136,11 +172,12 @@ static void fji(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
         else od[r]=(int64_t)lua_tointeger(L,-1);
         lua_pop(L,1);
     }
+    LUA_CLEANUP();
 }
 
 /* luajit_f(name, ...DOUBLE) → DOUBLE */
 static void fjf(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
-    L_();lua_State *L=g_lua;if(!L)return;
+    LUA_BEGIN();
     idx_t nr=duckdb_data_chunk_get_size(in),nc=duckdb_data_chunk_get_column_count(in);
     double*od=(double*)duckdb_vector_get_data(out);
     for(idx_t r=0;r<nr;r++){
@@ -154,21 +191,21 @@ static void fjf(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
         else od[r]=lua_tonumber(L,-1);
         lua_pop(L,1);
     }
+    LUA_CLEANUP();
 }
 
 /* luajit_v(name, ...DOUBLE) → DOUBLE  — chunk-batched: 1 Lua call per chunk */
 static void fjv(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
-    L_(); lua_State *L = g_lua;
-    if (!L) return;
+    LUA_BEGIN();
     idx_t nr = duckdb_data_chunk_get_size(in);
     idx_t nc = duckdb_data_chunk_get_column_count(in);
-    if (nr == 0 || nc < 2) return;
+    if (nr == 0 || nc < 2) goto lua_cleanup;
 
     double *od = (double *)duckdb_vector_get_data(out);
 
     /* Resolve UDF name (from first row's column 0) */
-    if (!resolve_udf(L, duckdb_data_chunk_get_vector(in, 0), 0)) return;
-    if (!lua_isfunction(L, -1)) { lua_pop(L, 1); return; }
+    if (!resolve_udf(L, duckdb_data_chunk_get_vector(in, 0), 0)) goto lua_cleanup;
+    if (!lua_isfunction(L, -1)) { lua_pop(L, 1); goto lua_cleanup; }
 
     /* Build one Lua table per arg column: {val_1, val_2, ..., val_nr} */
     int nargs = (int)(nc - 1);
@@ -185,7 +222,7 @@ static void fjv(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     /* Call UDF(t1, t2, ...) once per chunk — func already at bottom */
     if (lua_pcall(L, nargs, 1, 0) != LUA_OK || !lua_istable(L, -1)) {
         lua_pop(L, lua_gettop(L)); /* clear stack */
-        return;
+        goto lua_cleanup;
     }
 
     /* Unpack result table → output vector */
@@ -196,11 +233,12 @@ static void fjv(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
         lua_pop(L, 1);
     }
     lua_pop(L, 1);
+    LUA_CLEANUP();
 }
 
 /* luajit_b(name, ...BOOLEAN) → BOOLEAN */
 static void fjb(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
-    L_();lua_State *L=g_lua;if(!L)return;
+    LUA_BEGIN();
     idx_t nr=duckdb_data_chunk_get_size(in),nc=duckdb_data_chunk_get_column_count(in);
     bool*od=(bool*)duckdb_vector_get_data(out);
     for(idx_t r=0;r<nr;r++){
@@ -215,11 +253,12 @@ static void fjb(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
         else od[r]=lua_toboolean(L,-1)?true:false;
         lua_pop(L,1);
     }
+    LUA_CLEANUP();
 }
 
 /* luajit_m(name, ...DOUBLE) → DOUBLE  (mixed-type: all args auto-cast to double) */
 static void fjm(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
-    L_();lua_State *L=g_lua;if(!L)return;
+    LUA_BEGIN();
     idx_t nr=duckdb_data_chunk_get_size(in),nc=duckdb_data_chunk_get_column_count(in);
     double*od=(double*)duckdb_vector_get_data(out);
     for(idx_t r=0;r<nr;r++){
@@ -245,6 +284,7 @@ static void fjm(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
         else od[r]=lua_tonumber(L,-1);
         lua_pop(L,1);
     }
+    LUA_CLEANUP();
 }
 
 /* ── LIST bridge ── */
@@ -295,7 +335,7 @@ static void write_lua_to_list(lua_State *L, duckdb_vector out, duckdb_vector chi
 }
 
 static void fjl(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
-    L_(); lua_State *L = g_lua; if (!L) return;
+    LUA_BEGIN();
     idx_t nr = duckdb_data_chunk_get_size(in), nc = duckdb_data_chunk_get_column_count(in);
     duckdb_vector oc = duckdb_list_vector_get_child(out);
     for (idx_t r = 0; r < nr; r++) {
@@ -311,6 +351,7 @@ static void fjl(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
         write_lua_to_list(L, out, oc, r);
         lua_pop(L, 1);
     }
+    LUA_CLEANUP();
 }
 
 /* ── STRUCT bridge: DuckDB STRUCT ↔ Lua table (named keys) ── */
@@ -374,7 +415,7 @@ static void write_lua_to_struct(lua_State *L, duckdb_vector out, idx_t row) {
 }
 
 static void fjs(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
-    L_(); lua_State *L = g_lua; if (!L) return;
+    LUA_BEGIN();
     idx_t nr = duckdb_data_chunk_get_size(in);
     for (idx_t r = 0; r < nr; r++) {
         if (!resolve_udf(L, duckdb_data_chunk_get_vector(in, 0), r))
@@ -386,6 +427,7 @@ static void fjs(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
         duckdb_vector_assign_string_element(out, r, lua_tostring(L, -1));
         lua_pop(L, 1);
     }
+    LUA_CLEANUP();
 }
 
 /* ── MAP bridge: DuckDB MAP ↔ Lua table (key→value) ── */
@@ -425,7 +467,7 @@ static void push_map_to_lua(lua_State *L, duckdb_vector mv, idx_t r) {
 }
 
 static void fjm_map(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
-    L_(); lua_State *L = g_lua; if (!L) return;
+    LUA_BEGIN();
     idx_t nr = duckdb_data_chunk_get_size(in);
     for (idx_t r = 0; r < nr; r++) {
         if (!resolve_udf(L, duckdb_data_chunk_get_vector(in, 0), r))
@@ -437,6 +479,7 @@ static void fjm_map(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector
         duckdb_vector_assign_string_element(out, r, lua_tostring(L, -1));
         lua_pop(L, 1);
     }
+    LUA_CLEANUP();
 }
 
 /* ── Aggregate UDF: luajit_agg(name, arg) → DOUBLE ── */
@@ -445,8 +488,9 @@ static void fjm_map(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector
 static int load_udfs_from_file(const char *path) {
     FILE *fp = fopen(path, "r");
     if (!fp) return 0;
+    LUA_LOCK();
     L_(); lua_State *L = g_lua;
-    if (!L) { fclose(fp); return 0; }
+    if (!L) { fclose(fp); LUA_UNLOCK(); return 0; }
 
     int loaded = 0;
     char line[16384];
@@ -465,39 +509,32 @@ static int load_udfs_from_file(const char *path) {
         loaded++;
     }
     fclose(fp);
+    LUA_UNLOCK();
     return loaded;
 }
 
-#define AGG_MAX_GROUPS 256
+/* Per-state aggregate: values live inside DuckDB's aggregate state (a
+ * pointer-sized slot), so parallel threads each own their own group and
+ * agg_combine merges them — no global state, thread-safe by construction. */
 typedef struct {
-    uintptr_t key;       /* state pointer as group ID */
+    char    *udf;       /* UDF name (strdup'd on first row) */
     double  *vals; idx_t len, cap;
 } agg_group_t;
 
-static agg_group_t g_agg_groups[AGG_MAX_GROUPS];
-static int g_agg_n_groups = 0;
-static char *g_agg_udf = NULL;
+static idx_t agg_state_size(duckdb_function_info fi) { (void)fi; return sizeof(agg_group_t *); }
 
-/* find or create group by state pointer key */
-static agg_group_t *agg_find_group(uintptr_t key) {
-    for (int i = 0; i < g_agg_n_groups; i++)
-        if (g_agg_groups[i].key == key) return &g_agg_groups[i];
-    if (g_agg_n_groups >= AGG_MAX_GROUPS) return NULL;
-    agg_group_t *g = &g_agg_groups[g_agg_n_groups++];
-    memset(g, 0, sizeof(*g)); g->key = key;
-    return g;
+static void agg_init(duckdb_function_info fi, duckdb_aggregate_state st) {
+    (void)fi;
+    agg_group_t *g = (agg_group_t *)malloc(sizeof(agg_group_t));
+    memset(g, 0, sizeof(*g));
+    *(agg_group_t **)st = g;
 }
-
-static idx_t agg_state_size(duckdb_function_info fi) { (void)fi; return 8; }
-static void agg_init(duckdb_function_info fi, duckdb_aggregate_state st) { (void)fi; memset(st, 0, 8); }
-
 static void agg_update(duckdb_function_info fi, duckdb_data_chunk in, duckdb_aggregate_state *states) {
-
-    if (!g_agg_udf) {
-        duckdb_vector nv = duckdb_data_chunk_get_vector(in, 0);
-        duckdb_string_t ns = ((duckdb_string_t *)duckdb_vector_get_data(nv))[0];
-        g_agg_udf = strdup(duckdb_string_t_data(&ns));
-    }
+    (void)fi;
+    duckdb_vector nv = duckdb_data_chunk_get_vector(in, 0);
+    duckdb_string_t ns0 = ((duckdb_string_t *)duckdb_vector_get_data(nv))[0];
+    const char *udf_name = duckdb_string_t_data(&ns0);
+    idx_t udf_len = duckdb_string_t_length(ns0);
 
     duckdb_vector cv = duckdb_data_chunk_get_vector(in, 1);
     double *cd = (double *)duckdb_vector_get_data(cv);
@@ -506,9 +543,13 @@ static void agg_update(duckdb_function_info fi, duckdb_data_chunk in, duckdb_agg
 
     for (idx_t i = 0; i < chunk_nr; i++) {
         if (validity && !(validity[i / 64] & (1ULL << (i % 64)))) continue;
-        uintptr_t key = (uintptr_t)states[i];
-        agg_group_t *g = agg_find_group(key);
-        if (!g) return; /* too many groups */
+        agg_group_t *g = *(agg_group_t **)states[i];
+        if (!g) continue;
+        if (!g->udf) {
+            g->udf = (char *)malloc(udf_len + 1);
+            memcpy(g->udf, udf_name, udf_len);
+            g->udf[udf_len] = 0;
+        }
         if (g->len + 1 > g->cap) {
             g->cap = g->cap ? g->cap * 2 : 1024;
             g->vals = (double *)realloc(g->vals, g->cap * sizeof(double));
@@ -516,42 +557,76 @@ static void agg_update(duckdb_function_info fi, duckdb_data_chunk in, duckdb_agg
         g->vals[g->len++] = cd[i];
     }
 }
-static void agg_combine(duckdb_function_info fi, duckdb_aggregate_state *s, duckdb_aggregate_state *d, idx_t c) { (void)fi; (void)s; (void)d; (void)c; }
-static void agg_destroy(duckdb_function_info fi, duckdb_aggregate_state *states, idx_t count) { (void)fi; (void)states; (void)count; }
+
+/* Merge source state into destination, then free the source group. */
+static void agg_combine(duckdb_function_info fi, duckdb_aggregate_state *s, duckdb_aggregate_state *d, idx_t c) {
+    (void)fi;
+    for (idx_t i = 0; i < c; i++) {
+        agg_group_t *sg = s[i] ? *(agg_group_t **)s[i] : NULL;
+        agg_group_t *dg = d[i] ? *(agg_group_t **)d[i] : NULL;
+        if (!sg) continue;
+        if (!dg) { *(agg_group_t **)d[i] = sg; *(agg_group_t **)s[i] = NULL; continue; }
+        if (!dg->udf && sg->udf) { dg->udf = sg->udf; sg->udf = NULL; }
+        for (idx_t j = 0; j < sg->len; j++) {
+            if (dg->len + 1 > dg->cap) {
+                dg->cap = dg->cap ? dg->cap * 2 : 1024;
+                dg->vals = (double *)realloc(dg->vals, dg->cap * sizeof(double));
+            }
+            dg->vals[dg->len++] = sg->vals[j];
+        }
+        free(sg->vals);
+        free(sg->udf);
+        free(sg);
+        *(agg_group_t **)s[i] = NULL;
+    }
+}
+
+static void agg_destroy(duckdb_function_info fi, duckdb_aggregate_state *states, idx_t count) {
+    (void)fi;
+    for (idx_t i = 0; i < count; i++) {
+        agg_group_t *g = *(agg_group_t **)states[i];
+        if (g) { free(g->vals); free(g->udf); free(g); }
+        *(agg_group_t **)states[i] = NULL;
+    }
+}
 
 static void agg_finalize(duckdb_function_info fi, duckdb_aggregate_state *src, duckdb_vector result, idx_t count, idx_t offset) {
+    LUA_LOCK();
+
     double *od = (double *)duckdb_vector_get_data(result);
-    int n_groups = g_agg_n_groups; char *udf = g_agg_udf;
-    g_agg_udf = NULL; g_agg_n_groups = 0;
 
     L_(); lua_State *L = g_lua;
-    if (!udf || !L) { free(udf); return; }
+    if (!L) { LUA_UNLOCK(); return; }
 
-    lua_getglobal(L, udf);
-    if (!lua_isfunction(L, -1)) { lua_pop(L, 1); free(udf); return; }
-    int udf_ref = luaL_ref(L, LUA_REGISTRYINDEX); /* keep UDF alive across calls */
+    int udf_ref = LUA_NOREF;
+    const char *udf_name = NULL;
 
-    for (int g_idx = 0; g_idx < n_groups && g_idx < (int)count; g_idx++) {
-        agg_group_t *g = &g_agg_groups[g_idx];
-        if (!g->vals || g->len == 0) { od[offset + g_idx] = 0.0; continue; }
+    for (idx_t i = 0; i < count; i++) {
+        agg_group_t *g = *(agg_group_t **)src[i];
+        if (!g || !g->vals || g->len == 0 || !g->udf) { od[offset + i] = 0.0; continue; }
+
+        /* (Re)resolve the Lua UDF when the name changes across states */
+        if (!udf_name || strcmp(udf_name, g->udf)) {
+            if (udf_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, udf_ref);
+            udf_name = g->udf;
+            lua_getglobal(L, udf_name);
+            if (!lua_isfunction(L, -1)) { lua_pop(L, 1); udf_ref = LUA_NOREF; od[offset + i] = 0.0; continue; }
+            udf_ref = luaL_ref(L, LUA_REGISTRYINDEX); /* keep UDF alive across calls */
+        }
 
         lua_rawgeti(L, LUA_REGISTRYINDEX, udf_ref);
         lua_createtable(L, (int)g->len, 0);
-        for (idx_t i = 0; i < g->len; i++)
-            { lua_pushnumber(L, g->vals[i]); lua_rawseti(L, -2, (int)(i + 1)); }
+        for (idx_t j = 0; j < g->len; j++)
+            { lua_pushnumber(L, g->vals[j]); lua_rawseti(L, -2, (int)(j + 1)); }
 
         if (lua_pcall(L, 1, 1, 0) == LUA_OK && lua_isnumber(L, -1))
-            od[offset + g_idx] = lua_tonumber(L, -1);
+            od[offset + i] = lua_tonumber(L, -1);
         else
-            od[offset + g_idx] = 0.0;
+            od[offset + i] = 0.0;
         lua_pop(L, 1);
     }
-    luaL_unref(L, LUA_REGISTRYINDEX, udf_ref);
-
-    /* free all group arrays */
-    for (int g_idx = 0; g_idx < n_groups; g_idx++)
-        free(g_agg_groups[g_idx].vals);
-    free(udf);
+    if (udf_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, udf_ref);
+    LUA_UNLOCK();
 }
 
 /* ── luajit_table: Lua table function ── */
@@ -570,6 +645,7 @@ static void tbt_bind(duckdb_bind_info info) {
 }
 
 static void tbt_init(duckdb_init_info info) {
+    LUA_LOCK();
     tbt_data_t *d = (tbt_data_t *)duckdb_init_get_bind_data(info);
     tbt_state_t *s = (tbt_state_t *)duckdb_malloc(sizeof(tbt_state_t));
     memset(s, 0, sizeof(*s));
@@ -577,20 +653,20 @@ static void tbt_init(duckdb_init_info info) {
 
     if (d && d->source) {
         L_(); lua_State *L = g_lua;
-        if (!L) return;
+        if (!L) { LUA_UNLOCK(); return; }
 
         /* Try compiled UDF first, then inline source */
         lua_getglobal(L, d->source);
         if (!lua_isfunction(L, -1)) {
             lua_pop(L, 1);
             /* Compile inline source → function on stack */
-            if (luaL_loadstring(L, d->source) != LUA_OK) { lua_pop(L, 1); return; }
-            if (lua_pcall(L, 0, 1, 0) != LUA_OK) { lua_pop(L, 1); return; }
+            if (luaL_loadstring(L, d->source) != LUA_OK) { lua_pop(L, 1); LUA_UNLOCK(); return; }
+            if (lua_pcall(L, 0, 1, 0) != LUA_OK) { lua_pop(L, 1); LUA_UNLOCK(); return; }
         }
         /* Now call the function (compiled or inline) */
-        if (!lua_isfunction(L, -1)) { lua_pop(L, 1); return; }
-        if (lua_pcall(L, 0, 1, 0) != LUA_OK) { lua_pop(L, 1); return; }
-        if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
+        if (!lua_isfunction(L, -1)) { lua_pop(L, 1); LUA_UNLOCK(); return; }
+        if (lua_pcall(L, 0, 1, 0) != LUA_OK) { lua_pop(L, 1); LUA_UNLOCK(); return; }
+        if (!lua_istable(L, -1)) { lua_pop(L, 1); LUA_UNLOCK(); return; }
 
         int n = (int)lua_objlen(L, -1);
         s->nrows = n;
@@ -603,6 +679,7 @@ static void tbt_init(duckdb_init_info info) {
         }
         lua_pop(L, 1); /* pop result table */
     }
+    LUA_UNLOCK();
 }
 
 static void tbt_func(duckdb_function_info fi, duckdb_data_chunk out) {
@@ -639,7 +716,8 @@ static void mod_bind(duckdb_bind_info info) {
     duckdb_bind_set_bind_data(info,d,free);
 }
 
-static void mod_init(duckdb_init_info info) {
+/* mod_init_locked: full logic (all modes). Caller holds LUA_LOCK. */
+static void mod_init_locked(duckdb_init_info info) {
     bind_t *d=(bind_t*)duckdb_init_get_bind_data(info);
     if(!d)return;
     state_t *s=(state_t*)duckdb_malloc(sizeof(state_t));
@@ -895,6 +973,13 @@ static void mod_init(duckdb_init_info info) {
     d->ok=true;d->sql_name=strdup(d->sql_name);
 }
 
+/* Thread-safe entry: all luajit_module modes touch the shared Lua state. */
+static void mod_init(duckdb_init_info info) {
+    LUA_LOCK();
+    mod_init_locked(info);
+    LUA_UNLOCK();
+}
+
 static void mod_func(duckdb_function_info fi, duckdb_data_chunk out) {
     bind_t *d=(bind_t*)duckdb_function_get_bind_data(fi);
     state_t *s=(state_t*)duckdb_function_get_init_data(fi);
@@ -914,6 +999,7 @@ void luajit_register_module_functions(
     duckdb_connection conn, duckdb_extension_info ei, struct duckdb_extension_access *acc)
 {
     (void)ei;(void)acc;
+    lua_lock_init();
     L_();
 
     /* Create persistent connection for Lua→DuckDB callbacks */
