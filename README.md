@@ -161,7 +161,8 @@ SELECT luajit('
   finalize). trusted sandbox applies lazily per state (on and off).
 - **Per-type executors**: specialized callbacks for each DuckDB type, UDF resolved once per chunk (registry ref)
 - **Nested types**: LIST/STRUCT/MAP bridge via DUCKDB_TYPE_ANY
-- **Benchmark** (100K rows): luajit_i = 0.0035s, native = 0.0003s; luajit_v batch ≈ 3.6× native (single-thread)
+- **Benchmark** (1M rows, 2 BIGINT args, `a*b+a`): row-mode 0.034s (1t) → 0.013s (4t); batch-mode (`luajit_vi`) 0.018s (1t) → 0.013s (4t) = **2.6× vs row+serial**
+- **FFI zero-copy (P5) — deliberately not implemented**: passing column data as cdata arrays would break UDF compatibility (`#t`, table ops) and cdata arithmetic is only partially JIT-traceable; batch tables are pre-allocated (`lua_createtable(n)`) so the push path is already amortized
 
 ## Documentation
 
