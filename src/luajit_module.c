@@ -79,6 +79,66 @@ static duckdb_connection g_conn = NULL;
  * corrupted state (crash inside std::string::assign). This is our own stable
  * error channel instead. */
 static char *g_last_error = NULL;
+/* Trusted/sandbox mode (N1 from pllua study): when on, dangerous globals
+ * (io, ffi, package, require, load*, debug) are removed and os is reduced to
+ * date/clock/time/difftime. Originals are stashed in the registry so the
+ * mode can be toggled back off. Toggle via luajit_module(mode:='trusted',
+ * source:='on'|'off'). */
+static bool g_trusted = false;
+
+static void apply_trusted(lua_State *L, bool on) {
+    if (!L) return;
+    if (on && !g_trusted) {
+        static const char *dead[] = {"io","ffi","package","require","dofile",
+                                     "loadfile","load","loadstring","debug",NULL};
+        for (int i = 0; dead[i]; i++) {
+            /* stash original */
+            lua_getglobal(L, dead[i]);
+            if (!lua_isnil(L, -1)) {
+                lua_pushvalue(L, -1);
+                lua_setfield(L, LUA_REGISTRYINDEX, "lj_orig");
+                lua_setfield(L, LUA_REGISTRYINDEX, dead[i]);
+            }
+            lua_pop(L, 1);
+            lua_pushnil(L);
+            lua_setglobal(L, dead[i]);
+        }
+        /* os: keep only date/clock/time/difftime */
+        lua_getglobal(L, "os");
+        if (lua_istable(L, -1)) {
+            static const char *keep[] = {"date","clock","time","difftime"};
+            lua_pushvalue(L, -1);
+            lua_setfield(L, LUA_REGISTRYINDEX, "lj_orig_os");
+            lua_createtable(L, 0, 4);
+            for (int i = 0; i < 4; i++) {
+                lua_getfield(L, -2, keep[i]);
+                lua_setfield(L, -2, keep[i]);
+            }
+            lua_setglobal(L, "os");
+        }
+        lua_pop(L, 1);
+        g_trusted = true;
+    } else if (!on && g_trusted) {
+        static const char *dead[] = {"io","ffi","package","require","dofile",
+                                     "loadfile","load","loadstring","debug",NULL};
+        for (int i = 0; dead[i]; i++) {
+            lua_getfield(L, LUA_REGISTRYINDEX, "lj_orig");
+            lua_getfield(L, LUA_REGISTRYINDEX, dead[i]);
+            if (!lua_isnil(L, -1)) lua_setglobal(L, dead[i]);
+            else { lua_pop(L, 1); lua_pushnil(L); lua_setglobal(L, dead[i]); }
+            lua_pushnil(L);
+            lua_setfield(L, LUA_REGISTRYINDEX, dead[i]);
+            lua_pop(L, 1);
+        }
+        lua_getfield(L, LUA_REGISTRYINDEX, "lj_orig_os");
+        if (!lua_isnil(L, -1)) lua_setglobal(L, "os");
+        else { lua_pop(L, 1); lua_pushnil(L); lua_setglobal(L, "os"); }
+        lua_pushnil(L);
+        lua_setfield(L, LUA_REGISTRYINDEX, "lj_orig_os");
+        lua_pop(L, 1);
+        g_trusted = false;
+    }
+}
 
 /* ── DuckDB callback from Lua: _duckdb_call(sql) → status VARCHAR ── */
 static int l_duckdb_call(lua_State *L) {
@@ -981,6 +1041,17 @@ static void mod_init_locked(duckdb_init_info info) {
     if(!strcmp(m,"last_error")){
         d->ok=true;d->phase="last_error";
         d->msg=strdup(g_last_error?g_last_error:"(no error)");
+        return;
+    }
+
+    /* ── trusted mode: toggle sandbox (on/off) ── */
+    if(!strcmp(m,"trusted")){
+        const char *tsrc = d->source;
+        bool on = tsrc && (!strcmp(tsrc,"on")||!strcmp(tsrc,"1")||!strcmp(tsrc,"true"));
+        apply_trusted(g_lua, on);
+        d->ok=true; d->phase="trusted";
+        d->msg=strdup(on ? "trusted mode ON — io/ffi/package/require/load*/debug removed, os reduced" :
+                           "trusted mode OFF — full Lua restored");
         return;
     }
 

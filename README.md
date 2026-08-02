@@ -93,6 +93,7 @@ end');
 | `list` | — | List compiled UDFs |
 | `drop` | sql_name | Remove one UDF |
 | `reset` | — | Clear all UDFs |
+| **`trusted`** | `'on'`/`'off'` | Sandbox toggle: removes io/ffi/package/require/load*/debug, reduces os to date/clock/time/difftime |
 | **`last_error`** | — | Most recent Lua UDF runtime error |
 | **`save`** | source? (path) | Persist to file |
 | **`load`** | source? (path) | Restore from file |
@@ -137,7 +138,7 @@ SELECT luajit('return _duckdb_call("CREATE TABLE log(ts TIMESTAMP DEFAULT NOW())
 
 - **LuaJIT 2.1** (MIT, **GC64 build**): ~700KB, self-contained, trace-based JIT
 - **14 functions**: 10 scalar (3 chunk-batched), 1 aggregate (GROUP BY), 1 table, 1 module
-- **12 modes**: info, last_error, compile, quick_compile, inspect, macro, list, drop, reset, save, load
+- **13 modes**: info, trusted, last_error, compile, quick_compile, inspect, macro, list, drop, reset, save, load
 - **Per-group state**: aggregate uses state-pointer-keyed array (256 max groups)
 - **Per-type executors**: specialized callbacks for each DuckDB type, UDF resolved once per chunk (registry ref)
 - **Nested types**: LIST/STRUCT/MAP bridge via DUCKDB_TYPE_ANY
