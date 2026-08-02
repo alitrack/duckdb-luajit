@@ -109,3 +109,4 @@ SELECT message FROM luajit_module(mode := 'save', source := 'my_udfs.txt');
 4. **局部化**：`local sin = math.sin`；函数全部 `local`
 5. **字符串**：热循环里别 `..` 拼接（interned 不释放）→ `table.concat` / `string.buffer`
 6. **别手写 CSE**：`a[i][j] = a[i][j] * a[i][j+1]` 放心写，JIT 比你聪明
+7. **LIST 桥的 NULL 元素**：DuckDB 的 `[1, NULL, 3]` 到 Lua 是 `{1, nil, 3}`——Lua 的 `#` 和 `ipairs` 遇到中间 nil 会**截断**（`#{1,nil,3}` = 1）。遍历带 NULL 的列表请用 `for i=1, table.maxn(t)` 或显式 `t[i] ~= nil` 判断，或用 `select('#', ...)` 风格计数

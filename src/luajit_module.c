@@ -448,22 +448,26 @@ static void push_list_to_lua(lua_State *L, duckdb_vector list_vec, duckdb_vector
     list_entry_t *entries = (list_entry_t *)duckdb_vector_get_data(list_vec);
     uint64_t off = entries[r].offset, len = entries[r].length;
     duckdb_type ct = duckdb_get_type_id(duckdb_vector_get_column_type(child_vec));
+    uint64_t *validity = duckdb_vector_get_validity(child_vec);
     lua_createtable(L, (int)len, 0);
-    if (ct == DUCKDB_TYPE_BIGINT || ct == DUCKDB_TYPE_INTEGER) {
-        int64_t *d = (int64_t *)duckdb_vector_get_data(child_vec);
-        for (uint64_t i = 0; i < len; i++)
-            { lua_pushinteger(L, (lua_Integer)d[off + i]); lua_rawseti(L, -2, (int)(i + 1)); }
-    } else if (ct == DUCKDB_TYPE_DOUBLE || ct == DUCKDB_TYPE_FLOAT) {
-        double *d = (double *)duckdb_vector_get_data(child_vec);
-        for (uint64_t i = 0; i < len; i++)
-            { lua_pushnumber(L, d[off + i]); lua_rawseti(L, -2, (int)(i + 1)); }
-    } else if (ct == DUCKDB_TYPE_VARCHAR) {
-        duckdb_string_t *d = (duckdb_string_t *)duckdb_vector_get_data(child_vec);
-        for (uint64_t i = 0; i < len; i++) {
-            duckdb_string_t s = d[off + i];
+    for (uint64_t i = 0; i < len; i++) {
+        idx_t p = off + i;
+        if (validity && !duckdb_validity_row_is_valid(validity, p)) {
+            lua_pushnil(L);  /* NULL element → nil, not garbage */
+        } else if (ct == DUCKDB_TYPE_BIGINT || ct == DUCKDB_TYPE_INTEGER ||
+                   ct == DUCKDB_TYPE_SMALLINT || ct == DUCKDB_TYPE_TINYINT) {
+            lua_pushinteger(L, (lua_Integer)((int64_t *)duckdb_vector_get_data(child_vec))[p]);
+        } else if (ct == DUCKDB_TYPE_DOUBLE || ct == DUCKDB_TYPE_FLOAT) {
+            lua_pushnumber(L, ((double *)duckdb_vector_get_data(child_vec))[p]);
+        } else if (ct == DUCKDB_TYPE_BOOLEAN) {
+            lua_pushboolean(L, ((bool *)duckdb_vector_get_data(child_vec))[p]);
+        } else if (ct == DUCKDB_TYPE_VARCHAR) {
+            duckdb_string_t s = ((duckdb_string_t *)duckdb_vector_get_data(child_vec))[p];
             lua_pushlstring(L, duckdb_string_t_data(&s), duckdb_string_t_length(s));
-            lua_rawseti(L, -2, (int)(i + 1));
+        } else {
+            lua_pushnil(L);
         }
+        lua_rawseti(L, -2, (int)(i + 1));
     }
 }
 
@@ -475,12 +479,19 @@ static void write_lua_to_list(lua_State *L, duckdb_vector out, duckdb_vector chi
     list_entry_t *e = (list_entry_t *)duckdb_vector_get_data(out);
     e[row].offset = cs; e[row].length = n;
     duckdb_list_vector_set_size(out, cs + n);
+    uint64_t *validity = NULL;
     for (int i = 0; i < n; i++) {
         lua_rawgeti(L, -1, i + 1); idx_t p = cs + i;
-        if (ct == DUCKDB_TYPE_DOUBLE || ct == DUCKDB_TYPE_FLOAT)
-            ((double *)duckdb_vector_get_data(child))[p] = lua_isnumber(L, -1) ? lua_tonumber(L, -1) : 0.0;
-        else if (ct == DUCKDB_TYPE_BIGINT || ct == DUCKDB_TYPE_INTEGER)
-            ((int64_t *)duckdb_vector_get_data(child))[p] = lua_isnumber(L, -1) ? (int64_t)lua_tointeger(L, -1) : 0;
+        if (lua_isnil(L, -1)) {
+            if (!validity) { duckdb_vector_ensure_validity_writable(child); validity = duckdb_vector_get_validity(child); }
+            duckdb_validity_set_row_invalid(validity, p);
+        } else if (ct == DUCKDB_TYPE_DOUBLE || ct == DUCKDB_TYPE_FLOAT)
+            ((double *)duckdb_vector_get_data(child))[p] = lua_tonumber(L, -1);
+        else if (ct == DUCKDB_TYPE_BIGINT || ct == DUCKDB_TYPE_INTEGER ||
+                 ct == DUCKDB_TYPE_SMALLINT || ct == DUCKDB_TYPE_TINYINT)
+            ((int64_t *)duckdb_vector_get_data(child))[p] = (int64_t)lua_tointeger(L, -1);
+        else if (ct == DUCKDB_TYPE_BOOLEAN)
+            ((bool *)duckdb_vector_get_data(child))[p] = lua_toboolean(L, -1);
         else if (ct == DUCKDB_TYPE_VARCHAR)
             duckdb_vector_assign_string_element(child, p, lua_isstring(L, -1) ? lua_tostring(L, -1) : "");
         lua_pop(L, 1);
