@@ -1038,17 +1038,21 @@ static int load_udfs_from_file(const char *path) {
  * agg_combine merges them — no global state, thread-safe by construction. */
 typedef struct {
     char    *udf;       /* UDF name (strdup'd on first row) */
-    double  *vals; idx_t len, cap;
+    double  *vals; idx_t len, cap;    /* DOUBLE overload */
+    int64_t *ivals; idx_t ilen, icap; /* BIGINT overload */
+    int is_i64;                        /* set by agg_init from extra_info */
 } agg_group_t;
 
 static idx_t agg_state_size(duckdb_function_info fi) { (void)fi; return sizeof(agg_group_t *); }
 
-static void agg_init(duckdb_function_info fi, duckdb_aggregate_state st) {
-    (void)fi;
+static void agg_init_common(duckdb_aggregate_state st, int is_i64) {
     agg_group_t *g = (agg_group_t *)malloc(sizeof(agg_group_t));
     memset(g, 0, sizeof(*g));
+    g->is_i64 = is_i64;
     *(agg_group_t **)st = g;
 }
+static void agg_init(duckdb_function_info fi, duckdb_aggregate_state st)      { (void)fi; agg_init_common(st, 0); }
+static void agg_init_i64(duckdb_function_info fi, duckdb_aggregate_state st)  { (void)fi; agg_init_common(st, 1); }
 static void agg_update(duckdb_function_info fi, duckdb_data_chunk in, duckdb_aggregate_state *states) {
     (void)fi;
     duckdb_vector nv = duckdb_data_chunk_get_vector(in, 0);
@@ -1058,6 +1062,7 @@ static void agg_update(duckdb_function_info fi, duckdb_data_chunk in, duckdb_agg
 
     duckdb_vector cv = duckdb_data_chunk_get_vector(in, 1);
     double *cd = (double *)duckdb_vector_get_data(cv);
+    int64_t *ci = (int64_t *)cd;  /* same slot; interpreted per group type */
     uint64_t *validity = duckdb_vector_get_validity(cv);
     idx_t chunk_nr = duckdb_data_chunk_get_size(in);
 
@@ -1070,11 +1075,19 @@ static void agg_update(duckdb_function_info fi, duckdb_data_chunk in, duckdb_agg
             memcpy(g->udf, udf_name, udf_len);
             g->udf[udf_len] = 0;
         }
-        if (g->len + 1 > g->cap) {
-            g->cap = g->cap ? g->cap * 2 : 1024;
-            g->vals = (double *)realloc(g->vals, g->cap * sizeof(double));
+        if (g->is_i64) {
+            if (g->ilen + 1 > g->icap) {
+                g->icap = g->icap ? g->icap * 2 : 1024;
+                g->ivals = (int64_t *)realloc(g->ivals, g->icap * sizeof(int64_t));
+            }
+            g->ivals[g->ilen++] = ci[i];
+        } else {
+            if (g->len + 1 > g->cap) {
+                g->cap = g->cap ? g->cap * 2 : 1024;
+                g->vals = (double *)realloc(g->vals, g->cap * sizeof(double));
+            }
+            g->vals[g->len++] = cd[i];
         }
-        g->vals[g->len++] = cd[i];
     }
 }
 
@@ -1087,14 +1100,25 @@ static void agg_combine(duckdb_function_info fi, duckdb_aggregate_state *s, duck
         if (!sg) continue;
         if (!dg) { *(agg_group_t **)d[i] = sg; *(agg_group_t **)s[i] = NULL; continue; }
         if (!dg->udf && sg->udf) { dg->udf = sg->udf; sg->udf = NULL; }
-        for (idx_t j = 0; j < sg->len; j++) {
-            if (dg->len + 1 > dg->cap) {
-                dg->cap = dg->cap ? dg->cap * 2 : 1024;
-                dg->vals = (double *)realloc(dg->vals, dg->cap * sizeof(double));
+        if (sg->is_i64) {
+            for (idx_t j = 0; j < sg->ilen; j++) {
+                if (dg->ilen + 1 > dg->icap) {
+                    dg->icap = dg->icap ? dg->icap * 2 : 1024;
+                    dg->ivals = (int64_t *)realloc(dg->ivals, dg->icap * sizeof(int64_t));
+                }
+                dg->ivals[dg->ilen++] = sg->ivals[j];
             }
-            dg->vals[dg->len++] = sg->vals[j];
+            free(sg->ivals);
+        } else {
+            for (idx_t j = 0; j < sg->len; j++) {
+                if (dg->len + 1 > dg->cap) {
+                    dg->cap = dg->cap ? dg->cap * 2 : 1024;
+                    dg->vals = (double *)realloc(dg->vals, dg->cap * sizeof(double));
+                }
+                dg->vals[dg->len++] = sg->vals[j];
+            }
+            free(sg->vals);
         }
-        free(sg->vals);
         free(sg->udf);
         free(sg);
         *(agg_group_t **)s[i] = NULL;
@@ -1105,7 +1129,7 @@ static void agg_destroy(duckdb_function_info fi, duckdb_aggregate_state *states,
     (void)fi;
     for (idx_t i = 0; i < count; i++) {
         agg_group_t *g = *(agg_group_t **)states[i];
-        if (g) { free(g->vals); free(g->udf); free(g); }
+        if (g) { free(g->vals); free(g->ivals); free(g->udf); free(g); }
         *(agg_group_t **)states[i] = NULL;
     }
 }
@@ -1114,6 +1138,7 @@ static void agg_finalize(duckdb_function_info fi, duckdb_aggregate_state *src, d
     LUA_LOCK();
 
     double *od = (double *)duckdb_vector_get_data(result);
+    int64_t *od64 = (int64_t *)od;  /* same slot; per-group interpretation */
 
     L_(); lua_State *L = g_lua;
     if (!L) { LUA_UNLOCK(); return; }
@@ -1123,7 +1148,11 @@ static void agg_finalize(duckdb_function_info fi, duckdb_aggregate_state *src, d
 
     for (idx_t i = 0; i < count; i++) {
         agg_group_t *g = *(agg_group_t **)src[i];
-        if (!g || !g->vals || g->len == 0 || !g->udf) { od[offset + i] = 0.0; continue; }
+        if (!g || !g->udf ||
+            (g->is_i64 ? (!g->ivals || g->ilen == 0) : (!g->vals || g->len == 0))) {
+            if (g && g->is_i64) od64[offset + i] = 0; else od[offset + i] = 0.0;
+            continue;
+        }
 
         /* (Re)resolve the Lua UDF when the name changes across states */
         if (!udf_name || strcmp(udf_name, g->udf)) {
@@ -1149,20 +1178,28 @@ static void agg_finalize(duckdb_function_info fi, duckdb_aggregate_state *src, d
                     }
                     free(src);
                 }
-                if (!ok) { udf_ref = LUA_NOREF; od[offset + i] = 0.0; continue; }
+                if (!ok) { udf_ref = LUA_NOREF; if (g->is_i64) od64[offset + i] = 0; else od[offset + i] = 0.0; continue; }
             }
             udf_ref = luaL_ref(L, LUA_REGISTRYINDEX); /* keep UDF alive across calls */
         }
 
         lua_rawgeti(L, LUA_REGISTRYINDEX, udf_ref);
-        lua_createtable(L, (int)g->len, 0);
-        for (idx_t j = 0; j < g->len; j++)
-            { lua_pushnumber(L, g->vals[j]); lua_rawseti(L, -2, (int)(j + 1)); }
+        if (g->is_i64) {
+            lua_createtable(L, (int)g->ilen, 0);
+            for (idx_t j = 0; j < g->ilen; j++)
+                { lua_pushnumber(L, (lua_Number)g->ivals[j]); lua_rawseti(L, -2, (int)(j + 1)); }
+        } else {
+            lua_createtable(L, (int)g->len, 0);
+            for (idx_t j = 0; j < g->len; j++)
+                { lua_pushnumber(L, g->vals[j]); lua_rawseti(L, -2, (int)(j + 1)); }
+        }
 
-        if (lua_pcall(L, 1, 1, 0) == LUA_OK && lua_isnumber(L, -1))
-            od[offset + i] = lua_tonumber(L, -1);
-        else
-            od[offset + i] = 0.0;
+        if (lua_pcall(L, 1, 1, 0) == LUA_OK && lua_isnumber(L, -1)) {
+            if (g->is_i64) od64[offset + i] = (int64_t)lua_tonumber(L, -1);
+            else od[offset + i] = lua_tonumber(L, -1);
+        } else {
+            if (g->is_i64) od64[offset + i] = 0; else od[offset + i] = 0.0;
+        }
         lua_pop(L, 1);
     }
     if (udf_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, udf_ref);
@@ -1747,18 +1784,28 @@ void luajit_register_module_functions(
       duckdb_register_scalar_function(conn, f);
       duckdb_destroy_scalar_function(&f); }
 
-    /* luajit_agg: aggregate UDF — accumulate values, call Lua on finalize */
-    { duckdb_aggregate_function f = duckdb_create_aggregate_function();
-      duckdb_aggregate_function_set_name(f, "luajit_agg");
-      duckdb_aggregate_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-      duckdb_aggregate_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE));
-      duckdb_aggregate_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_DOUBLE));
-      duckdb_aggregate_function_set_functions(f, agg_state_size, agg_init, agg_update, agg_combine, agg_finalize);
-      { int *es = (int *)duckdb_malloc(sizeof(int));
-        *es = 42;
-        duckdb_aggregate_function_set_extra_info(f, es, free); }
-      duckdb_register_aggregate_function(conn, f);
-      duckdb_destroy_aggregate_function(&f); }
+    /* luajit_agg: aggregate UDF — accumulate values, call Lua on finalize.
+     * Function-set overloads: BIGINT in/out (exact integer accumulation,
+     * no float coercion) and DOUBLE in/out. Distinct init callbacks carry
+     * the i64 flag (agg init's fi has no extra_info). */
+    { duckdb_aggregate_function_set fs = duckdb_create_aggregate_function_set("luajit_agg");
+      for (int variant = 0; variant < 2; variant++) {
+        duckdb_aggregate_function f = duckdb_create_aggregate_function();
+        duckdb_aggregate_function_set_name(f, "luajit_agg");
+        duckdb_aggregate_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+        duckdb_aggregate_function_add_parameter(f,
+            duckdb_create_logical_type(variant == 0 ? DUCKDB_TYPE_BIGINT : DUCKDB_TYPE_DOUBLE));
+        duckdb_aggregate_function_set_return_type(f,
+            duckdb_create_logical_type(variant == 0 ? DUCKDB_TYPE_BIGINT : DUCKDB_TYPE_DOUBLE));
+        duckdb_aggregate_function_set_functions(f, agg_state_size,
+            variant == 0 ? agg_init_i64 : agg_init,
+            agg_update, agg_combine, agg_finalize);
+        if (duckdb_add_aggregate_function_to_set(fs, f) == DuckDBError) {
+          duckdb_destroy_aggregate_function(&f);
+        }
+      }
+      duckdb_register_aggregate_function_set(conn, fs);
+      duckdb_destroy_aggregate_function_set(&fs); }
     #undef REG
     #undef VARGS
     #undef END
