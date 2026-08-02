@@ -141,6 +141,11 @@ static void apply_trusted(lua_State *L, bool on) {
 }
 
 /* ── DuckDB callback from Lua: _duckdb_call(sql) → status VARCHAR ── */
+
+/* forward decls (defined with the type helpers below; used by _duckdb_query) */
+static void push_timestamp_micros(lua_State *L, int64_t micros);
+static void push_decimal_any(lua_State *L, duckdb_logical_type lt, void *data, idx_t r);
+
 static int l_duckdb_call(lua_State *L) {
     if (!g_conn) { lua_pushstring(L, "no connection"); return 1; }
     const char *sql = luaL_checkstring(L, 1);
@@ -198,6 +203,22 @@ static int l_duckdb_query(lua_State *L) {
                     lua_pushnumber(L, ((double *)data)[r]);
                 } else if (ct == DUCKDB_TYPE_BOOLEAN) {
                     lua_pushboolean(L, ((bool *)data)[r]);
+                } else if (ct == DUCKDB_TYPE_DATE) {
+                    duckdb_date_struct ds = duckdb_from_date(((duckdb_date *)data)[r]);
+                    char buf[16]; snprintf(buf, sizeof(buf), "%04d-%02d-%02d", ds.year, ds.month, ds.day);
+                    lua_pushstring(L, buf);
+                } else if (ct == DUCKDB_TYPE_TIMESTAMP || ct == DUCKDB_TYPE_TIMESTAMP_S ||
+                           ct == DUCKDB_TYPE_TIMESTAMP_MS || ct == DUCKDB_TYPE_TIMESTAMP_NS) {
+                    int64_t us;
+                    if (ct == DUCKDB_TYPE_TIMESTAMP_S)      us = ((duckdb_timestamp_s *)data)[r].seconds * 1000000;
+                    else if (ct == DUCKDB_TYPE_TIMESTAMP_MS) us = ((int64_t *)data)[r] * 1000;
+                    else if (ct == DUCKDB_TYPE_TIMESTAMP_NS) us = ((int64_t *)data)[r] / 1000;
+                    else                                      us = ((duckdb_timestamp *)data)[r].micros;
+                    push_timestamp_micros(L, us);
+                } else if (ct == DUCKDB_TYPE_DECIMAL) {
+                    push_decimal_any(L, duckdb_vector_get_column_type(v), data, r);
+                } else if (ct == DUCKDB_TYPE_HUGEINT || ct == DUCKDB_TYPE_UHUGEINT) {
+                    lua_pushnumber(L, duckdb_hugeint_to_double(((duckdb_hugeint *)data)[r]));
                 } else if (ct == DUCKDB_TYPE_VARCHAR) {
                     duckdb_string_t s = ((duckdb_string_t *)data)[r];
                     lua_pushlstring(L, duckdb_string_t_data(&s), duckdb_string_t_length(s));
@@ -229,7 +250,7 @@ static void L_(void) {
 
 /* ── helpers ── */
 
-/* forward decl (defined with the executor helpers below; used by fj first) */
+/* forward decls (defined with the executor helpers below; used earlier) */
 static void mark_invalid(duckdb_vector out, idx_t r);
 
 static void push_str(lua_State *L, duckdb_vector v, idx_t r) {
@@ -256,6 +277,52 @@ static void push_bool(lua_State *L, duckdb_vector v, idx_t r) {
         lua_pushnil(L);
     else
         lua_pushinteger(L, d[r] ? 1 : 0); /* Lua boolean can't do arithmetic */
+}
+/* DATE → 'YYYY-MM-DD' (ISO), NULL → nil */
+static void push_date(lua_State *L, duckdb_vector v, idx_t r) {
+    if(!duckdb_validity_row_is_valid(duckdb_vector_get_validity(v),r)){lua_pushnil(L);return;}
+    duckdb_date_struct ds=duckdb_from_date(((duckdb_date*)duckdb_vector_get_data(v))[r]);
+    char buf[16];snprintf(buf,sizeof(buf),"%04d-%02d-%02d",ds.year,ds.month,ds.day);
+    lua_pushstring(L,buf);
+}
+/* TIMESTAMP (micros) → 'YYYY-MM-DD HH:MM:SS' */
+static void push_timestamp_micros(lua_State *L, int64_t micros) {
+    duckdb_timestamp t; t.micros = micros;
+    duckdb_timestamp_struct ts = duckdb_from_timestamp(t);
+    char buf[32];snprintf(buf,sizeof(buf),"%04d-%02d-%02d %02d:%02d:%02d",
+        ts.date.year,ts.date.month,ts.date.day,ts.time.hour,ts.time.min,ts.time.sec);
+    lua_pushstring(L,buf);
+}
+/* TIMESTAMP family (auto unit conversion; NULL → nil) */
+static void push_timestamp(lua_State *L, duckdb_vector v, idx_t r) {
+    if(!duckdb_validity_row_is_valid(duckdb_vector_get_validity(v),r)){lua_pushnil(L);return;}
+    duckdb_type dt=duckdb_get_type_id(duckdb_vector_get_column_type(v));
+    int64_t us;
+    if(dt==DUCKDB_TYPE_TIMESTAMP_S)      us=((duckdb_timestamp_s*)duckdb_vector_get_data(v))[r].seconds*1000000;
+    else if(dt==DUCKDB_TYPE_TIMESTAMP_MS)us=((int64_t*)duckdb_vector_get_data(v))[r]*1000;
+    else if(dt==DUCKDB_TYPE_TIMESTAMP_NS)us=((int64_t*)duckdb_vector_get_data(v))[r]/1000;
+    else                                 us=((duckdb_timestamp*)duckdb_vector_get_data(v))[r].micros;
+    push_timestamp_micros(L,us);
+}
+/* DECIMAL → Lua number. DuckDB stores DECIMAL as int64 (width<=18) or
+ * int128/hugeint (width>18), NOT as the duckdb_decimal struct — read raw
+ * and divide by 10^scale from the logical type. */
+static void push_decimal_any(lua_State *L, duckdb_logical_type lt, void *data, idx_t r) {
+    uint8_t scale = duckdb_decimal_scale(lt);
+    uint8_t width = duckdb_decimal_width(lt);
+    double val = (width <= 18) ? (double)((int64_t *)data)[r]
+                               : duckdb_hugeint_to_double(((duckdb_hugeint *)data)[r]);
+    double p = 1.0; for (int i = 0; i < scale; i++) p *= 10.0;
+    lua_pushnumber(L, val / p);
+}
+static void push_decimal(lua_State *L, duckdb_vector v, idx_t r) {
+    if(!duckdb_validity_row_is_valid(duckdb_vector_get_validity(v),r)){lua_pushnil(L);return;}
+    push_decimal_any(L, duckdb_vector_get_column_type(v), duckdb_vector_get_data(v), r);
+}
+/* HUGEINT → Lua number (double precision, NULL → nil) */
+static void push_hugeint(lua_State *L, duckdb_vector v, idx_t r) {
+    if(!duckdb_validity_row_is_valid(duckdb_vector_get_validity(v),r)){lua_pushnil(L);return;}
+    lua_pushnumber(L,duckdb_hugeint_to_double(((duckdb_hugeint*)duckdb_vector_get_data(v))[r]));
 }
 static void to_str(lua_State *L) {
     if(lua_isnil(L,-1))return;if(lua_isstring(L,-1))return;
@@ -548,6 +615,14 @@ static void fjm(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
                 push_flt(L,v,r);
             else if(dt==DUCKDB_TYPE_BOOLEAN)
                 push_bool(L,v,r);
+            else if(dt==DUCKDB_TYPE_DATE)
+                push_date(L,v,r);
+            else if(dt==DUCKDB_TYPE_TIMESTAMP||dt==DUCKDB_TYPE_TIMESTAMP_S||dt==DUCKDB_TYPE_TIMESTAMP_MS||dt==DUCKDB_TYPE_TIMESTAMP_NS)
+                push_timestamp(L,v,r);
+            else if(dt==DUCKDB_TYPE_DECIMAL)
+                push_decimal(L,v,r);
+            else if(dt==DUCKDB_TYPE_HUGEINT||dt==DUCKDB_TYPE_UHUGEINT)
+                push_hugeint(L,v,r);
             else
                 push_str(L,v,r);
         }
@@ -582,6 +657,23 @@ static void push_list_to_lua(lua_State *L, duckdb_vector list_vec, duckdb_vector
             lua_pushnumber(L, ((double *)duckdb_vector_get_data(child_vec))[p]);
         } else if (ct == DUCKDB_TYPE_BOOLEAN) {
             lua_pushboolean(L, ((bool *)duckdb_vector_get_data(child_vec))[p]);
+        } else if (ct == DUCKDB_TYPE_DATE) {
+            duckdb_date_struct ds = duckdb_from_date(((duckdb_date *)duckdb_vector_get_data(child_vec))[p]);
+            char buf[16]; snprintf(buf, sizeof(buf), "%04d-%02d-%02d", ds.year, ds.month, ds.day);
+            lua_pushstring(L, buf);
+        } else if (ct == DUCKDB_TYPE_TIMESTAMP || ct == DUCKDB_TYPE_TIMESTAMP_S ||
+                   ct == DUCKDB_TYPE_TIMESTAMP_MS || ct == DUCKDB_TYPE_TIMESTAMP_NS) {
+            duckdb_type tct = ct;
+            int64_t us;
+            if (tct == DUCKDB_TYPE_TIMESTAMP_S)      us = ((duckdb_timestamp_s *)duckdb_vector_get_data(child_vec))[p].seconds * 1000000;
+            else if (tct == DUCKDB_TYPE_TIMESTAMP_MS) us = ((int64_t *)duckdb_vector_get_data(child_vec))[p] * 1000;
+            else if (tct == DUCKDB_TYPE_TIMESTAMP_NS) us = ((int64_t *)duckdb_vector_get_data(child_vec))[p] / 1000;
+            else                                      us = ((duckdb_timestamp *)duckdb_vector_get_data(child_vec))[p].micros;
+            push_timestamp_micros(L, us);
+        } else if (ct == DUCKDB_TYPE_DECIMAL) {
+            push_decimal_any(L, duckdb_vector_get_column_type(child_vec), duckdb_vector_get_data(child_vec), p);
+        } else if (ct == DUCKDB_TYPE_HUGEINT || ct == DUCKDB_TYPE_UHUGEINT) {
+            lua_pushnumber(L, duckdb_hugeint_to_double(((duckdb_hugeint *)duckdb_vector_get_data(child_vec))[p]));
         } else if (ct == DUCKDB_TYPE_VARCHAR) {
             duckdb_string_t s = ((duckdb_string_t *)duckdb_vector_get_data(child_vec))[p];
             lua_pushlstring(L, duckdb_string_t_data(&s), duckdb_string_t_length(s));
