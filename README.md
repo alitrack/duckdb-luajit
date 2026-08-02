@@ -1,8 +1,10 @@
-# luajit — DuckDB LuaJIT UDF Extension  v0.19
+# luajit — DuckDB LuaJIT UDF Extension  v0.20
 
 Self-contained DuckDB extension for Lua expressions, JIT-compiled UDFs, and nested type bridges via LuaJIT. ~700KB, MIT licensed.
 
-> **v0.19 changes**: trusted sandbox mode; `_duckdb_query` result-set bridge;
+> **v0.20 changes**: `luajit_agg` BIGINT overload — integer aggregation now
+> returns BIGINT exactly (no float coercion, matches native `sum(x)`); DOUBLE
+> overload preserved. v0.19: trusted sandbox mode; `_duckdb_query` result-set bridge;
 > DATE/TIMESTAMP/DECIMAL/HUGEINT bridging; streaming `luajit_table` generator
 > mode; chunk-batched BIGINT/VARCHAR UDFs (`luajit_vi`/`luajit_vs`); LIST bridge
 > NULL elements + BOOLEAN children; MSVC build fix.
