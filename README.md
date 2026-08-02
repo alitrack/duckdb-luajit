@@ -67,10 +67,18 @@ SELECT luajit_agg('mymedian', price) FROM trades;
 SELECT * FROM luajit_table('gen_data');
 -- (1, 'a'), (2, 'b'), (3, 'c')
 
--- Inline: function that returns a table
+-- Inline: function that returns a table (materialized at init)
 SELECT * FROM luajit_table(
     'return function() local t={};for i=1,100 do t[i]=i*i end;return t end'
 );
+
+-- Streaming: function returns a coroutine.wrap generator — O(1) memory,
+-- rows are pulled one chunk at a time (yield row_idx, val; nil ends)
+SELECT count(*) FROM luajit_table('return function()
+    return coroutine.wrap(function()
+        for i = 1, 1000000 do coroutine.yield(i, "row-" .. i) end
+    end)
+end');
 ```
 
 ## Module API (10 modes)

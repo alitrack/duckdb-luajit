@@ -818,7 +818,25 @@ static void agg_finalize(duckdb_function_info fi, duckdb_aggregate_state *src, d
 /* ── luajit_table: Lua table function ── */
 
 typedef struct { char *source; } tbt_data_t;
-typedef struct { int cur_row; char **rows; int nrows; } tbt_state_t;
+/* table mode: rows[] materialized at init; generator mode: gen_ref is a
+ * coroutine.wrap iterator resumed per chunk (streaming, O(1) memory). */
+typedef struct {
+    int cur_row; char **rows; int nrows;
+    int gen_ref;
+} tbt_state_t;
+
+static void tbt_state_free(void *p) {
+    tbt_state_t *s = (tbt_state_t *)p;
+    if (s) {
+        if (s->gen_ref != LUA_NOREF && g_lua) {
+            LUA_LOCK();
+            luaL_unref(g_lua, LUA_REGISTRYINDEX, s->gen_ref);
+            LUA_UNLOCK();
+        }
+        if (s->rows) duckdb_free(s->rows);
+        duckdb_free(s);
+    }
+}
 
 static void tbt_bind(duckdb_bind_info info) {
     tbt_data_t *d = (tbt_data_t *)duckdb_malloc(sizeof(tbt_data_t));
@@ -835,7 +853,8 @@ static void tbt_init(duckdb_init_info info) {
     tbt_data_t *d = (tbt_data_t *)duckdb_init_get_bind_data(info);
     tbt_state_t *s = (tbt_state_t *)duckdb_malloc(sizeof(tbt_state_t));
     memset(s, 0, sizeof(*s));
-    duckdb_init_set_init_data(info, s, free);
+    s->gen_ref = LUA_NOREF;
+    duckdb_init_set_init_data(info, s, tbt_state_free);
 
     if (d && d->source) {
         L_(); lua_State *L = g_lua;
@@ -852,6 +871,14 @@ static void tbt_init(duckdb_init_info info) {
         /* Now call the function (compiled or inline) */
         if (!lua_isfunction(L, -1)) { lua_pop(L, 1); LUA_UNLOCK(); return; }
         if (lua_pcall(L, 0, 1, 0) != LUA_OK) { lua_pop(L, 1); LUA_UNLOCK(); return; }
+
+        /* Generator mode: UDF returned a function (coroutine.wrap iterator) —
+         * stream rows via coroutine.resume per chunk instead of materializing. */
+        if (lua_isfunction(L, -1)) {
+            s->gen_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+            LUA_UNLOCK();
+            return;
+        }
         if (!lua_istable(L, -1)) { lua_pop(L, 1); LUA_UNLOCK(); return; }
 
         int n = (int)lua_objlen(L, -1);
@@ -870,7 +897,43 @@ static void tbt_init(duckdb_init_info info) {
 
 static void tbt_func(duckdb_function_info fi, duckdb_data_chunk out) {
     tbt_state_t *s = (tbt_state_t *)duckdb_function_get_init_data(fi);
-    if (!s || s->cur_row >= s->nrows) { duckdb_data_chunk_set_size(out, 0); return; }
+    if (!s) { duckdb_data_chunk_set_size(out, 0); return; }
+
+    /* Generator mode: resume coroutine.wrap iterator — yields (row_idx, val);
+     * nil row_idx (or dead coroutine) ends the stream. */
+    if (s->gen_ref != LUA_NOREF) {
+        LUA_LOCK();
+        lua_State *L = g_lua;
+        if (!L) { LUA_UNLOCK(); duckdb_data_chunk_set_size(out, 0); return; }
+        lua_rawgeti(L, LUA_REGISTRYINDEX, s->gen_ref);
+        if (lua_pcall(L, 0, 2, 0) != LUA_OK) {
+            const char *err = lua_tostring(L, -1);
+            char buf[256];
+            snprintf(buf, sizeof(buf), "luajit_table generator error: %s", err ? err : "unknown");
+            free(g_last_error);
+            g_last_error = strdup(buf);
+            lua_pop(L, 1);
+            LUA_UNLOCK();
+            duckdb_data_chunk_set_size(out, 0);
+            return;
+        }
+        if (lua_isnil(L, -2)) {  /* generator exhausted */
+            lua_pop(L, 2);
+            LUA_UNLOCK();
+            duckdb_data_chunk_set_size(out, 0);
+            return;
+        }
+        duckdb_data_chunk_set_size(out, 1);
+        ((int64_t *)duckdb_vector_get_data(duckdb_data_chunk_get_vector(out, 0)))[0] = (int64_t)lua_tointeger(L, -2);
+        const char *v = lua_tostring(L, -1);
+        duckdb_vector_assign_string_element(duckdb_data_chunk_get_vector(out, 1), 0, v ? v : "");
+        lua_pop(L, 2);
+        LUA_UNLOCK();
+        return;
+    }
+
+    /* table mode: serve materialized rows */
+    if (s->cur_row >= s->nrows) { duckdb_data_chunk_set_size(out, 0); return; }
     duckdb_data_chunk_set_size(out, 1);
     ((int64_t *)duckdb_vector_get_data(duckdb_data_chunk_get_vector(out, 0)))[0] = s->cur_row + 1;
     duckdb_vector_assign_string_element(duckdb_data_chunk_get_vector(out, 1), 0,
