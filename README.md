@@ -153,6 +153,11 @@ SELECT luajit('
 - **14 functions**: 10 scalar (3 chunk-batched), 1 aggregate (GROUP BY), 1 table, 1 module
 - **13 modes**: info, trusted, last_error, compile, quick_compile, inspect, macro, list, drop, reset, save, load
 - **Per-group state**: aggregate uses state-pointer-keyed array (256 max groups)
+- **Per-thread Lua states (P4)**: each worker thread owns its lua_State via TLS —
+  no global lock on Lua execution, DuckDB thread parallelism maps to LuaJIT
+  parallelism (~2.4× on 4 threads, CPU-bound UDFs). UDF sources live in a
+  shared table; states compile lazily on first use (executor + aggregate
+  finalize). trusted sandbox applies lazily per state (on and off).
 - **Per-type executors**: specialized callbacks for each DuckDB type, UDF resolved once per chunk (registry ref)
 - **Nested types**: LIST/STRUCT/MAP bridge via DUCKDB_TYPE_ANY
 - **Benchmark** (100K rows): luajit_i = 0.0035s, native = 0.0003s; luajit_v batch ≈ 3.6× native (single-thread)

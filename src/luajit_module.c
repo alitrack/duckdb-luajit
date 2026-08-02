@@ -42,53 +42,122 @@ void luajit_register_module_functions(
  */
 #ifdef _WIN32
 #include <windows.h>
-static CRITICAL_SECTION g_lua_lock;
-static void lua_lock_init(void) { InitializeCriticalSection(&g_lua_lock); }
-#define LUA_LOCK()   EnterCriticalSection(&g_lua_lock)
-#define LUA_UNLOCK() LeaveCriticalSection(&g_lua_lock)
+static CRITICAL_SECTION g_udf_lock;
+static void lua_lock_init(void) { InitializeCriticalSection(&g_udf_lock); }
+#define LUA_LOCK()   EnterCriticalSection(&g_udf_lock)
+#define LUA_UNLOCK() LeaveCriticalSection(&g_udf_lock)
 #else
 #include <pthread.h>
-static pthread_mutex_t g_lua_lock;
+static pthread_mutex_t g_udf_lock;
 static void lua_lock_init(void) {
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-    pthread_mutex_init(&g_lua_lock, &attr);
+    pthread_mutex_init(&g_udf_lock, &attr);
     pthread_mutexattr_destroy(&attr);
 }
-#define LUA_LOCK()   pthread_mutex_lock(&g_lua_lock)
-#define LUA_UNLOCK() pthread_mutex_unlock(&g_lua_lock)
+#define LUA_LOCK()   pthread_mutex_lock(&g_udf_lock)
+#define LUA_UNLOCK() pthread_mutex_unlock(&g_udf_lock)
 #endif
 
-/* ── Thread-safety guard for executor bodies ──
- * Usage:
- *   static void fn(...) {
- *       LUA_BEGIN();              // locks, ensures g_lua, goto lua_cleanup if NULL
- *       ...                       // every early return becomes: goto lua_cleanup;
- *       LUA_CLEANUP();            // label + unlock
- *   }
+/* ── P4: per-thread lua_State + shared UDF source table ──
+ * Each worker thread gets its own lua_State via TLS — Lua execution is no
+ * longer serialized by a global lock, so DuckDB thread parallelism maps
+ * directly to LuaJIT parallelism (one JIT per thread).
+ *
+ * UDF *sources* live in a shared C table (g_udf_sources, guarded by
+ * g_udf_lock). Each state compiles lazily on first use (resolve_udf_chunk
+ * falls back to the shared table), so compile/drop/reset need only touch the
+ * shared table + the calling thread's state.
+ *
+ * LUA_LOCK now guards SHARED data only (udf table, g_last_error, g_trusted,
+ * g_conn) — never Lua state execution. It stays recursive so existing
+ * nesting (mod_init_locked → load_udfs_from_file) cannot deadlock.
  */
-#define LUA_BEGIN()  LUA_LOCK(); L_(); lua_State *L = g_lua; if (!L) goto lua_cleanup;
-#define LUA_CLEANUP() lua_cleanup: LUA_UNLOCK()
+#if defined(_MSC_VER)
+#define LUA_TLS __declspec(thread)
+#else
+#define LUA_TLS __thread
+#endif
 
-static lua_State *g_lua = NULL;
+static LUA_TLS lua_State *g_lua = NULL;
 static duckdb_connection g_conn = NULL;
-/* Last Lua UDF runtime error — set under LUA_LOCK, read via
- * luajit_module(mode:='last_error'). We do NOT use duckdb_function_set_error:
- * on DuckDB 1.2.0 the CFunctionInfo error string handed to us is in a
- * corrupted state (crash inside std::string::assign). This is our own stable
- * error channel instead. */
+/* Last Lua UDF runtime error — set/read under LUA_LOCK. We do NOT use
+ * duckdb_function_set_error: on DuckDB 1.2.0 the CFunctionInfo error string
+ * handed to us is in a corrupted state (crash inside std::string::assign).
+ * This is our own stable error channel instead. */
 static char *g_last_error = NULL;
 /* Trusted/sandbox mode (N1 from pllua study): when on, dangerous globals
  * (io, ffi, package, require, load*, debug) are removed and os is reduced to
  * date/clock/time/difftime. Originals are stashed in the registry so the
  * mode can be toggled back off. Toggle via luajit_module(mode:='trusted',
- * source:='on'|'off'). */
+ * source:='on'|'off'). Guarded by LUA_LOCK; applied to every state (existing
+ * + newly created in L_()). */
 static bool g_trusted = false;
+
+/* Shared UDF source table: name → source. Compiled per-state on demand. */
+#define MAX_UDFS 256
+typedef struct { char *name; char *source; } udf_src_t;
+static udf_src_t g_udf_sources[MAX_UDFS];
+static int g_udf_count = 0;
+
+/* Callers must hold LUA_LOCK. Returns strdup'd source or NULL. */
+static char *udf_source_get(const char *name) {
+    for (int i = 0; i < g_udf_count; i++)
+        if (!strcmp(g_udf_sources[i].name, name))
+            return strdup(g_udf_sources[i].source);
+    return NULL;
+}
+/* Callers must hold LUA_LOCK. Insert or replace. */
+static void udf_source_set(const char *name, const char *source) {
+    for (int i = 0; i < g_udf_count; i++) {
+        if (!strcmp(g_udf_sources[i].name, name)) {
+            free(g_udf_sources[i].source);
+            g_udf_sources[i].source = strdup(source);
+            return;
+        }
+    }
+    if (g_udf_count < MAX_UDFS) {
+        g_udf_sources[g_udf_count].name = strdup(name);
+        g_udf_sources[g_udf_count].source = strdup(source);
+        g_udf_count++;
+    }
+}
+/* Callers must hold LUA_LOCK. Returns true if removed. */
+static bool udf_source_del(const char *name) {
+    for (int i = 0; i < g_udf_count; i++) {
+        if (!strcmp(g_udf_sources[i].name, name)) {
+            free(g_udf_sources[i].name);
+            free(g_udf_sources[i].source);
+            g_udf_sources[i] = g_udf_sources[g_udf_count - 1];
+            g_udf_count--;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ── Executor entry guard ──
+ * P4: no global lock (each thread owns its lua_State via TLS). L_() lazily
+ * creates the state; goto lua_cleanup on failure. Shared data (udf table,
+ * last_error) is locked at the point of use, not here.
+ * Trusted mode is applied lazily per state: each executor checks the state's
+ * lj_trusted_applied registry flag against the global g_trusted and applies
+ * the sandbox on first touch (threads that created their state before the
+ * toggle still get sandboxed).
+ */
+#define LUA_BEGIN()  L_(); lua_State *L = g_lua; if (!L) goto lua_cleanup; \
+    lua_getfield(L, LUA_REGISTRYINDEX, "lj_trusted_applied"); \
+    int _lj_tr = lua_toboolean(L, -1); lua_pop(L, 1); \
+    if (g_trusted && !_lj_tr) apply_trusted(L, true); \
+    else if (!g_trusted && _lj_tr) apply_trusted(L, false);
+#define LUA_CLEANUP() lua_cleanup:
 
 static void apply_trusted(lua_State *L, bool on) {
     if (!L) return;
-    if (on && !g_trusted) {
+    if (on) {
+        /* Idempotent: re-applying to an already-sandboxed state is a no-op
+         * (dangerous globals are already nil; os already reduced). */
         static const char *dead[] = {"io","ffi","package","require","dofile",
                                      "loadfile","load","loadstring","debug",NULL};
         for (int i = 0; dead[i]; i++) {
@@ -118,7 +187,12 @@ static void apply_trusted(lua_State *L, bool on) {
         }
         lua_pop(L, 1);
         g_trusted = true;
-    } else if (!on && g_trusted) {
+        lua_pushboolean(L, 1);
+        lua_setfield(L, LUA_REGISTRYINDEX, "lj_trusted_applied");
+    } else if (!on) {
+        /* Idempotent restore: no-op for states that were never sandboxed
+         * (lj_orig_* registry entries absent → globals set to nil, matching
+         * their original state). */
         static const char *dead[] = {"io","ffi","package","require","dofile",
                                      "loadfile","load","loadstring","debug",NULL};
         for (int i = 0; dead[i]; i++) {
@@ -137,6 +211,8 @@ static void apply_trusted(lua_State *L, bool on) {
         lua_setfield(L, LUA_REGISTRYINDEX, "lj_orig_os");
         lua_pop(L, 1);
         g_trusted = false;
+        lua_pushboolean(L, 0);
+        lua_setfield(L, LUA_REGISTRYINDEX, "lj_trusted_applied");
     }
 }
 
@@ -150,7 +226,10 @@ static int l_duckdb_call(lua_State *L) {
     if (!g_conn) { lua_pushstring(L, "no connection"); return 1; }
     const char *sql = luaL_checkstring(L, 1);
     duckdb_result res;
-    if (duckdb_query(g_conn, sql, &res) != DuckDBSuccess) {
+    LUA_LOCK();  /* P4: g_conn is shared across threads */
+    duckdb_state st = duckdb_query(g_conn, sql, &res);
+    LUA_UNLOCK();
+    if (st != DuckDBSuccess) {
         lua_pushfstring(L, "error: %s", duckdb_result_error(&res));
         duckdb_destroy_result(&res); return 1;
     }
@@ -168,7 +247,10 @@ static int l_duckdb_query(lua_State *L) {
     const char *sql = luaL_checkstring(L, 1);
     if (!g_conn) { lua_pushnil(L); lua_pushstring(L, "no connection"); return 2; }
     duckdb_result res;
-    if (duckdb_query(g_conn, sql, &res) != DuckDBSuccess) {
+    LUA_LOCK();  /* P4: g_conn is shared across threads */
+    duckdb_state st = duckdb_query(g_conn, sql, &res);
+    LUA_UNLOCK();
+    if (st != DuckDBSuccess) {
         const char *err = duckdb_result_error(&res);
         lua_pushnil(L);
         lua_pushstring(L, err ? err : "query error");
@@ -244,6 +326,11 @@ static void L_(void) {
             lua_setglobal(g_lua, "_duckdb_call");
             lua_pushcfunction(g_lua, l_duckdb_query);
             lua_setglobal(g_lua, "_duckdb_query");
+            /* P4: apply trusted sandbox to every (new) state if globally on */
+            LUA_LOCK();
+            bool trusted = g_trusted;
+            LUA_UNLOCK();
+            if (trusted) apply_trusted(g_lua, true);
         }
     }
 }
@@ -359,9 +446,27 @@ static void fj(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out)
 static int resolve_udf_chunk(lua_State *L, duckdb_vector nv) {
     duckdb_string_t ns=((duckdb_string_t*)duckdb_vector_get_data(nv))[0];
     if(!duckdb_validity_row_is_valid(duckdb_vector_get_validity(nv),0)) return LUA_NOREF;
-    lua_getglobal(L,duckdb_string_t_data(&ns));
-    if(!lua_isfunction(L,-1)){lua_pop(L,1);return LUA_NOREF;}
-    return luaL_ref(L,LUA_REGISTRYINDEX);
+    const char *name = duckdb_string_t_data(&ns);
+    lua_getglobal(L,name);
+    if(lua_isfunction(L,-1)) return luaL_ref(L,LUA_REGISTRYINDEX);
+    lua_pop(L,1);
+    /* P4: UDF may have been compiled on another thread's state — lazily
+     * compile from the shared source table into this thread's state. */
+    LUA_LOCK();
+    char *src = udf_source_get(name);
+    LUA_UNLOCK();
+    if (!src) return LUA_NOREF;
+    int ref = LUA_NOREF;
+    if (luaL_loadstring(L, src) == LUA_OK && lua_pcall(L, 0, 1, 0) == LUA_OK &&
+        lua_isfunction(L, -1)) {
+        lua_pushvalue(L, -1);
+        lua_setglobal(L, name);  /* cache in this state */
+        ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    } else {
+        lua_pop(L, lua_gettop(L));  /* drop load/compile error */
+    }
+    free(src);
+    return ref;
 }
 
 /* Mark all rows of a result vector invalid (unresolved UDF). */
@@ -381,8 +486,10 @@ static NOINLINE int call_udf(duckdb_function_info fi, lua_State *L, int nargs, i
         const char *err=lua_tostring(L,-1);
         char buf[512];
         snprintf(buf,sizeof(buf),"luajit UDF error: %s",err?err:"unknown");
+        LUA_LOCK();
         free(g_last_error);
         g_last_error = strdup(buf);
+        LUA_UNLOCK();
         lua_pop(L,1);
         return 0;
     }
@@ -905,6 +1012,8 @@ static int load_udfs_from_file(const char *path) {
         if (lua_pcall(L, 0, 1, 0) != LUA_OK) { lua_pop(L, 1); continue; }
         if (!lua_isfunction(L, -1)) { lua_pop(L, 1); continue; }
         lua_setglobal(L, name);
+        /* P4: register in shared table so other threads can lazy-compile */
+        udf_source_set(name, source);
         loaded++;
     }
     fclose(fp);
@@ -1009,7 +1118,27 @@ static void agg_finalize(duckdb_function_info fi, duckdb_aggregate_state *src, d
             if (udf_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, udf_ref);
             udf_name = g->udf;
             lua_getglobal(L, udf_name);
-            if (!lua_isfunction(L, -1)) { lua_pop(L, 1); udf_ref = LUA_NOREF; od[offset + i] = 0.0; continue; }
+            if (!lua_isfunction(L, -1)) {
+                lua_pop(L, 1);
+                /* P4: lazily compile from the shared source table — the UDF
+                 * may have been compiled on another thread's state. */
+                LUA_LOCK();
+                char *src = udf_source_get(udf_name);
+                LUA_UNLOCK();
+                int ok = 0;
+                if (src) {
+                    if (luaL_loadstring(L, src) == LUA_OK && lua_pcall(L, 0, 1, 0) == LUA_OK &&
+                        lua_isfunction(L, -1)) {
+                        lua_pushvalue(L, -1);
+                        lua_setglobal(L, udf_name);
+                        ok = 1;
+                    } else {
+                        lua_pop(L, lua_gettop(L));
+                    }
+                    free(src);
+                }
+                if (!ok) { udf_ref = LUA_NOREF; od[offset + i] = 0.0; continue; }
+            }
             udf_ref = luaL_ref(L, LUA_REGISTRYINDEX); /* keep UDF alive across calls */
         }
 
@@ -1201,7 +1330,8 @@ static void mod_init_locked(duckdb_init_info info) {
     if(!strcmp(m,"trusted")){
         const char *tsrc = d->source;
         bool on = tsrc && (!strcmp(tsrc,"on")||!strcmp(tsrc,"1")||!strcmp(tsrc,"true"));
-        apply_trusted(g_lua, on);
+        L_();  /* ensure a state exists before applying (P4: TLS) */
+        if (on || g_trusted) apply_trusted(g_lua, on);  /* off with no sandbox = no-op */
         d->ok=true; d->phase="trusted";
         d->msg=strdup(on ? "trusted mode ON — io/ffi/package/require/load*/debug removed, os reduced" :
                            "trusted mode OFF — full Lua restored");
@@ -1244,94 +1374,55 @@ static void mod_init_locked(duckdb_init_info info) {
         return;
     }
 
-    /* ── list mode: enumerate compiled UDFs ── */
+    /* ── list mode: enumerate compiled UDFs (P4: shared table) ── */
     if(!strcmp(m,"list")){
-        L_();lua_State *L=g_lua;
-        lua_getglobal(L,"_G");if(!lua_istable(L,-1)){d->msg=strdup("no globals");lua_pop(L,1);return;}
         char buf[4096]="";int off=0;
-        lua_pushnil(L);
-        while(lua_next(L,-2)){
-            if(lua_isfunction(L,-1)&&lua_type(L,-2)==LUA_TSTRING){
-                const char *k=lua_tostring(L,-2);
-                /* skip Lua builtins — only show user-compiled UDFs */
-                if(k[0]!='_' /* skip __pairs etc */
-                   && strcmp(k,"assert")&&strcmp(k,"collectgarbage")&&strcmp(k,"dofile")
-                   && strcmp(k,"error")&&strcmp(k,"gcinfo")&&strcmp(k,"getfenv")
-                   && strcmp(k,"getmetatable")&&strcmp(k,"ipairs")&&strcmp(k,"load")
-                   && strcmp(k,"loadfile")&&strcmp(k,"loadstring")&&strcmp(k,"module")
-                   && strcmp(k,"newproxy")&&strcmp(k,"next")&&strcmp(k,"pairs")
-                   && strcmp(k,"pcall")&&strcmp(k,"print")&&strcmp(k,"rawequal")
-                   && strcmp(k,"rawget")&&strcmp(k,"rawset")&&strcmp(k,"require")
-                   && strcmp(k,"select")&&strcmp(k,"setfenv")&&strcmp(k,"setmetatable")
-                   && strcmp(k,"tonumber")&&strcmp(k,"tostring")&&strcmp(k,"type")
-                   && strcmp(k,"unpack")&&strcmp(k,"xpcall"))
-                    off+=snprintf(buf+off,sizeof(buf)-off,"%s%s",off?", ":"",k);
-            }
-            lua_pop(L,1);
-        }
-        lua_pop(L,1);
+        LUA_LOCK();
+        for (int i=0;i<g_udf_count;i++)
+            off+=snprintf(buf+off,sizeof(buf)-off,"%s%s",off?", ":"",g_udf_sources[i].name);
+        LUA_UNLOCK();
         d->ok=true;d->phase="list";d->msg=strdup("UDFs");d->detail=strdup(buf[0]?buf:"(none)");
         d->sql_name=strdup(buf[0]?buf:"");
         return;
     }
 
-    /* ── drop mode: remove a compiled UDF ── */
+    /* ── drop mode: remove a compiled UDF (P4: shared + current state) ── */
     if(!strcmp(m,"drop")){
         if(!d->sql_name){d->msg=strdup("need sql_name");return;}
-        L_();lua_State *L=g_lua;
-        lua_pushnil(L);lua_setglobal(L,d->sql_name);
-        d->ok=true;d->phase="drop";d->sql_name=strdup(d->sql_name);
+        LUA_LOCK();
+        bool removed = udf_source_del(d->sql_name);
+        LUA_UNLOCK();
+        L_();if(g_lua){lua_pushnil(g_lua);lua_setglobal(g_lua,d->sql_name);}
+        d->ok=removed;d->phase="drop";d->sql_name=strdup(d->sql_name);
+        if(!removed)d->msg=strdup("UDF not found");
         return;
     }
 
-    /* ── reset mode: clear all UDFs ── */
+    /* ── reset mode: clear all UDFs (P4: shared table + current state) ── */
     if(!strcmp(m,"reset")){
-        L_();if(g_lua){lua_close(g_lua);g_lua=NULL;}L_();
-        d->ok=true;d->phase="reset";d->msg=strdup("Lua state reset");
+        LUA_LOCK();
+        for (int i=0;i<g_udf_count;i++){free(g_udf_sources[i].name);free(g_udf_sources[i].source);}
+        g_udf_count=0;
+        LUA_UNLOCK();
+        if(g_lua){lua_close(g_lua);g_lua=NULL;}
+        L_();
+        d->ok=true;d->phase="reset";d->msg=strdup("UDFs reset");
         return;
     }
 
-    /* ── save mode: persist UDFs to file ── */
+    /* ── save mode: persist UDFs to file (P4: shared table) ── */
     if(!strcmp(m,"save")){
         const char *path = d->source ? d->source : "luajit_udfs.txt";
-        L_();lua_State *L=g_lua;
-        if(!L){d->msg=strdup("no Lua");return;}
-
         FILE *fp=fopen(path,"w");
         if(!fp){d->msg=strdup("file write failed");return;}
 
-        /* Iterate globals, write name\\tsource per line */
-        lua_getglobal(L,"_G");lua_pushnil(L);
+        LUA_LOCK();
         int n_saved=0;
-        while(lua_next(L,-2)){
-            if(lua_isfunction(L,-1)&&lua_type(L,-2)==LUA_TSTRING){
-                const char *k=lua_tostring(L,-2);
-                if(k[0]!='_'
-                   &&strcmp(k,"assert")&&strcmp(k,"collectgarbage")&&strcmp(k,"dofile")
-                   &&strcmp(k,"error")&&strcmp(k,"gcinfo")&&strcmp(k,"getfenv")
-                   &&strcmp(k,"getmetatable")&&strcmp(k,"ipairs")&&strcmp(k,"load")
-                   &&strcmp(k,"loadfile")&&strcmp(k,"loadstring")&&strcmp(k,"module")
-                   &&strcmp(k,"newproxy")&&strcmp(k,"next")&&strcmp(k,"pairs")
-                   &&strcmp(k,"pcall")&&strcmp(k,"print")&&strcmp(k,"rawequal")
-                   &&strcmp(k,"rawget")&&strcmp(k,"rawset")&&strcmp(k,"require")
-                   &&strcmp(k,"select")&&strcmp(k,"setfenv")&&strcmp(k,"setmetatable")
-                   &&strcmp(k,"tonumber")&&strcmp(k,"tostring")&&strcmp(k,"type")
-                   &&strcmp(k,"unpack")&&strcmp(k,"xpcall"))
-                {
-                    /* Get source from _UDF_SOURCES registry */
-                    const char *src="?";
-                    lua_getglobal(L,"_UDF_SOURCES");
-                    if(lua_istable(L,-1)){lua_getfield(L,-1,k);if(lua_isstring(L,-1))src=lua_tostring(L,-1);lua_pop(L,1);}
-                    lua_pop(L,1);
-                    if(strcmp(src,"?")){  /* skip source-less globals (N5: no broken entries) */
-                        fprintf(fp,"%s\t%s\n",k,src);
-                        n_saved++;
-                    }
-                }
-            }
-            lua_pop(L,1);
+        for(int i=0;i<g_udf_count;i++){
+            fprintf(fp,"%s\t%s\n",g_udf_sources[i].name,g_udf_sources[i].source);
+            n_saved++;
         }
-        lua_pop(L,1);
+        LUA_UNLOCK();
         fclose(fp);
 
         d->ok=true;d->phase="save";
@@ -1422,6 +1513,8 @@ static void mod_init_locked(duckdb_init_info info) {
         lua_pop(L,1);
 
         lua_setglobal(L,d->sql_name);
+        /* P4: register in shared table (other threads compile lazily) */
+        udf_source_set(d->sql_name, d->source);
         /* Step 5: generate macro DDL */
         const char *fn=*var=='i'?"luajit_i":*var=='f'?"luajit_f":*var=='b'?"luajit_b":"luajit";
         char buf[2048];int off=snprintf(buf,sizeof(buf),"CREATE OR REPLACE MACRO %s(",d->sql_name);
@@ -1448,6 +1541,8 @@ static void mod_init_locked(duckdb_init_info info) {
     if(!lua_isfunction(L,-1))
         {d->msg=strdup("must return a function");lua_pop(L,1);return;}
     lua_setglobal(L,d->sql_name);
+    /* P4: register in shared table (other threads compile lazily) */
+    udf_source_set(d->sql_name, d->source);
     /* save source for persistence */
     lua_getglobal(L,"_UDF_SOURCES");
     if(!lua_istable(L,-1)){lua_pop(L,1);lua_newtable(L);lua_setglobal(L,"_UDF_SOURCES");lua_getglobal(L,"_UDF_SOURCES");}
