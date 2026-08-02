@@ -1,6 +1,12 @@
-# luajit — DuckDB LuaJIT UDF Extension  v0.17
+# luajit — DuckDB LuaJIT UDF Extension  v0.18
 
 Self-contained DuckDB extension for Lua expressions, JIT-compiled UDFs, and nested type bridges via LuaJIT. ~700KB, MIT licensed.
+
+> **v0.18 changes**: LuaJIT built with **GC64** (2GB memory wall removed), UDF
+> resolution moved from per-row to per-chunk (registry refs — ~6× faster
+> row-mode UDFs), runtime Lua errors now queryable via
+> `luajit_module(mode:='last_error')`, and a crash fix for LIST outputs when
+> the UDF name is undefined.
 
 ## Quick Start
 
@@ -76,10 +82,21 @@ SELECT * FROM luajit_table(
 | `list` | — | List compiled UDFs |
 | `drop` | sql_name | Remove one UDF |
 | `reset` | — | Clear all UDFs |
+| **`last_error`** | — | Most recent Lua UDF runtime error |
 | **`save`** | source? (path) | Persist to file |
 | **`load`** | source? (path) | Restore from file |
 
 Result: `(ok BOOLEAN, mode, phase, message, detail, sql_name VARCHAR)`
+
+### Error handling
+
+A Lua runtime error in a UDF (e.g. `return x + nil`) marks the affected rows
+NULL **and** records the real error message — retrieve it after the query:
+
+```sql
+SELECT message FROM luajit_module(mode:='last_error');
+-- luajit UDF error: [string "..."]:1: attempt to perform arithmetic on a nil value
+```
 
 ### Persistence
 
@@ -107,13 +124,13 @@ SELECT luajit('return _duckdb_call("CREATE TABLE log(ts TIMESTAMP DEFAULT NOW())
 
 ## Design
 
-- **LuaJIT 2.1** (MIT): ~700KB, self-contained, trace-based JIT
-- **11 functions**: 8 scalar, 1 aggregate (GROUP BY), 1 table, 1 module
-- **10 modes**: info, compile, quick_compile, inspect, macro, list, drop, reset, save, load
+- **LuaJIT 2.1** (MIT, **GC64 build**): ~700KB, self-contained, trace-based JIT
+- **12 functions**: 8 scalar, 1 aggregate (GROUP BY), 1 table, 1 module
+- **12 modes**: info, last_error, compile, quick_compile, inspect, macro, list, drop, reset, save, load
 - **Per-group state**: aggregate uses state-pointer-keyed array (256 max groups)
-- **Per-type executors**: specialized callbacks for each DuckDB type
+- **Per-type executors**: specialized callbacks for each DuckDB type, UDF resolved once per chunk (registry ref)
 - **Nested types**: LIST/STRUCT/MAP bridge via DUCKDB_TYPE_ANY
-- **Benchmark**: 50K rows: luajit_i = 0.011s, native = 0.006s (1.9× slower — good for JIT UDF)
+- **Benchmark** (100K rows): luajit_i = 0.0035s, native = 0.0003s; luajit_v batch ≈ 3.6× native (single-thread)
 
 ## Build
 

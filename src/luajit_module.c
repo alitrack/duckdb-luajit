@@ -66,6 +66,12 @@ static void lua_lock_init(void) {
 
 static lua_State *g_lua = NULL;
 static duckdb_connection g_conn = NULL;
+/* Last Lua UDF runtime error — set under LUA_LOCK, read via
+ * luajit_module(mode:='last_error'). We do NOT use duckdb_function_set_error:
+ * on DuckDB 1.2.0 the CFunctionInfo error string handed to us is in a
+ * corrupted state (crash inside std::string::assign). This is our own stable
+ * error channel instead. */
+static char *g_last_error = NULL;
 
 /* ── DuckDB callback from Lua: _duckdb_call(sql) → status VARCHAR ── */
 static int l_duckdb_call(lua_State *L) {
@@ -94,6 +100,9 @@ static void L_(void) {
 }
 
 /* ── helpers ── */
+
+/* forward decl (defined with the executor helpers below; used by fj first) */
+static void mark_invalid(duckdb_vector out, idx_t r);
 
 static void push_str(lua_State *L, duckdb_vector v, idx_t r) {
     duckdb_string_t s=((duckdb_string_t*)duckdb_vector_get_data(v))[r];
@@ -134,11 +143,11 @@ static void fj(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out)
         duckdb_vector sv=duckdb_data_chunk_get_vector(in,0);
         duckdb_string_t ss=((duckdb_string_t*)duckdb_vector_get_data(sv))[r];
         if(!duckdb_validity_row_is_valid(duckdb_vector_get_validity(sv),r))
-            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);continue;}
+            {mark_invalid(out,r);continue;}
         int ok=luaL_loadbuffer(L,duckdb_string_t_data(&ss),duckdb_string_t_length(ss),"lj");
         ok=ok||lua_pcall(L,0,1,0);
         if(ok){duckdb_vector_assign_string_element(out,r,lua_tostring(L,-1));lua_pop(L,1);continue;}
-        if(lua_isnil(L,-1))duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);
+        if(lua_isnil(L,-1))mark_invalid(out,r);
         else{to_str(L);duckdb_vector_assign_string_element(out,r,lua_tostring(L,-1));lua_pop(L,1);}
         lua_pop(L,1);
     }
@@ -147,13 +156,59 @@ static void fj(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out)
 
 /* ── UDF executors ── */
 
-static int resolve_udf(lua_State *L, duckdb_vector nv, idx_t r) {
-    duckdb_string_t ns=((duckdb_string_t*)duckdb_vector_get_data(nv))[r];
-    if(!duckdb_validity_row_is_valid(duckdb_vector_get_validity(nv),r)) return 0;
+/* ── Chunk-level UDF resolution + error reporting (P2/P1: 2026-08) ──
+ * resolve_udf_chunk: resolve UDF name from chunk row 0 → registry ref.
+ *   LUA_NOREF if name is NULL or not a function. One global lookup per chunk
+ *   instead of per row (old resolve_udf did a lua_getglobal for every row).
+ */
+static int resolve_udf_chunk(lua_State *L, duckdb_vector nv) {
+    duckdb_string_t ns=((duckdb_string_t*)duckdb_vector_get_data(nv))[0];
+    if(!duckdb_validity_row_is_valid(duckdb_vector_get_validity(nv),0)) return LUA_NOREF;
     lua_getglobal(L,duckdb_string_t_data(&ns));
-    int ok=lua_isfunction(L,-1);
-    if(!ok)lua_pop(L,1);
-    return ok;
+    if(!lua_isfunction(L,-1)){lua_pop(L,1);return LUA_NOREF;}
+    return luaL_ref(L,LUA_REGISTRYINDEX);
+}
+
+/* Mark all rows of a result vector invalid (unresolved UDF). */
+static void invalidate_all(duckdb_vector out, idx_t n) {
+    duckdb_vector_ensure_validity_writable(out);
+    uint64_t *v=duckdb_vector_get_validity(out);
+    memset(v,0,((n+63)/64)*sizeof(uint64_t));
+}
+
+/* Call the UDF (already on stack) with nargs args. On Lua error: record the
+ * error message into g_last_error (queryable via luajit_module mode
+ * 'last_error'); the affected rows are invalidated by the caller.
+ * noinline: keep the error path out of the hot loop. */
+__attribute__((noinline))
+static int call_udf(duckdb_function_info fi, lua_State *L, int nargs, int nresults) {
+    (void)fi;
+    if(lua_pcall(L,nargs,nresults,0)!=LUA_OK){
+        const char *err=lua_tostring(L,-1);
+        char buf[512];
+        snprintf(buf,sizeof(buf),"luajit UDF error: %s",err?err:"unknown");
+        free(g_last_error);
+        g_last_error = strdup(buf);
+        lua_pop(L,1);
+        return 0;
+    }
+    return 1;
+}
+
+/* Mark one row invalid — MUST ensure the validity mask is writable first:
+ * DuckDB's fast path hands out NULL validity for NULL-free vectors, and
+ * duckdb_validity_set_row_invalid(NULL) would crash. */
+static void mark_invalid(duckdb_vector out, idx_t r) {
+    duckdb_vector_ensure_validity_writable(out);
+    uint64_t *v=duckdb_vector_get_validity(out);
+    duckdb_validity_set_row_invalid(v, r);
+}
+
+/* Invalidate rows [r, nr) — used when an UDF error aborts mid-chunk. */
+static void invalidate_from(duckdb_vector out, idx_t r, idx_t nr) {
+    duckdb_vector_ensure_validity_writable(out);
+    uint64_t *v=duckdb_vector_get_validity(out);
+    for(idx_t i=r;i<nr;i++) duckdb_validity_set_row_invalid(v,i);
 }
 
 /* luajit_i(name, ...BIGINT) → BIGINT */
@@ -161,17 +216,19 @@ static void fji(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     LUA_BEGIN();
     idx_t nr=duckdb_data_chunk_get_size(in),nc=duckdb_data_chunk_get_column_count(in);
     int64_t*od=(int64_t*)duckdb_vector_get_data(out);
+    int udf_ref=LUA_NOREF;
+    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0));
+    if(udf_ref==LUA_NOREF){invalidate_all(out,nr);goto lua_cleanup;}
     for(idx_t r=0;r<nr;r++){
-        if(!resolve_udf(L,duckdb_data_chunk_get_vector(in,0),r))
-            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);continue;}
+        lua_rawgeti(L,LUA_REGISTRYINDEX,udf_ref);
         for(idx_t c=1;c<nc;c++)push_int(L,duckdb_data_chunk_get_vector(in,c),r);
-        if(lua_pcall(L,(int)(nc-1),1,0)!=LUA_OK)
-            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);lua_pop(L,1);continue;}
+        if(!call_udf(fi,L,(int)(nc-1),1)){invalidate_from(out,r,nr);break;}
         if(lua_isnil(L,-1)||!lua_isnumber(L,-1))
-            duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);
+            mark_invalid(out,r);
         else od[r]=(int64_t)lua_tointeger(L,-1);
         lua_pop(L,1);
     }
+    luaL_unref(L,LUA_REGISTRYINDEX,udf_ref);
     LUA_CLEANUP();
 }
 
@@ -180,17 +237,19 @@ static void fjf(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     LUA_BEGIN();
     idx_t nr=duckdb_data_chunk_get_size(in),nc=duckdb_data_chunk_get_column_count(in);
     double*od=(double*)duckdb_vector_get_data(out);
+    int udf_ref=LUA_NOREF;
+    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0));
+    if(udf_ref==LUA_NOREF){invalidate_all(out,nr);goto lua_cleanup;}
     for(idx_t r=0;r<nr;r++){
-        if(!resolve_udf(L,duckdb_data_chunk_get_vector(in,0),r))
-            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);continue;}
+        lua_rawgeti(L,LUA_REGISTRYINDEX,udf_ref);
         for(idx_t c=1;c<nc;c++)push_flt(L,duckdb_data_chunk_get_vector(in,c),r);
-        if(lua_pcall(L,(int)(nc-1),1,0)!=LUA_OK)
-            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);lua_pop(L,1);continue;}
+        if(!call_udf(fi,L,(int)(nc-1),1)){invalidate_from(out,r,nr);break;}
         if(lua_isnil(L,-1)||!lua_isnumber(L,-1))
-            duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);
+            mark_invalid(out,r);
         else od[r]=lua_tonumber(L,-1);
         lua_pop(L,1);
     }
+    luaL_unref(L,LUA_REGISTRYINDEX,udf_ref);
     LUA_CLEANUP();
 }
 
@@ -204,11 +263,12 @@ static void fjv(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     double *od = (double *)duckdb_vector_get_data(out);
 
     /* Resolve UDF name (from first row's column 0) */
-    if (!resolve_udf(L, duckdb_data_chunk_get_vector(in, 0), 0)) goto lua_cleanup;
-    if (!lua_isfunction(L, -1)) { lua_pop(L, 1); goto lua_cleanup; }
+    int udf_ref = resolve_udf_chunk(L, duckdb_data_chunk_get_vector(in, 0));
+    if (udf_ref == LUA_NOREF) { invalidate_all(out, nr); goto lua_cleanup; }
 
     /* Build one Lua table per arg column: {val_1, val_2, ..., val_nr} */
     int nargs = (int)(nc - 1);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, udf_ref);
     for (int c = 1; c < (int)nc; c++) {
         lua_createtable(L, (int)nr, 0);
         duckdb_vector v = duckdb_data_chunk_get_vector(in, (idx_t)c);
@@ -220,10 +280,8 @@ static void fjv(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     }
 
     /* Call UDF(t1, t2, ...) once per chunk — func already at bottom */
-    if (lua_pcall(L, nargs, 1, 0) != LUA_OK || !lua_istable(L, -1)) {
-        lua_pop(L, lua_gettop(L)); /* clear stack */
-        goto lua_cleanup;
-    }
+    if (!call_udf(fi, L, nargs, 1)) { luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
+    if (!lua_istable(L, -1)) { lua_pop(L, lua_gettop(L)); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
 
     /* Unpack result table → output vector */
     idx_t rlen = (idx_t)lua_objlen(L, -1);
@@ -233,6 +291,7 @@ static void fjv(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
         lua_pop(L, 1);
     }
     lua_pop(L, 1);
+    luaL_unref(L, LUA_REGISTRYINDEX, udf_ref);
     LUA_CLEANUP();
 }
 
@@ -241,18 +300,20 @@ static void fjb(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     LUA_BEGIN();
     idx_t nr=duckdb_data_chunk_get_size(in),nc=duckdb_data_chunk_get_column_count(in);
     bool*od=(bool*)duckdb_vector_get_data(out);
+    int udf_ref=LUA_NOREF;
+    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0));
+    if(udf_ref==LUA_NOREF){invalidate_all(out,nr);goto lua_cleanup;}
     for(idx_t r=0;r<nr;r++){
-        if(!resolve_udf(L,duckdb_data_chunk_get_vector(in,0),r))
-            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);continue;}
+        lua_rawgeti(L,LUA_REGISTRYINDEX,udf_ref);
         for(idx_t c=1;c<nc;c++)push_bool(L,duckdb_data_chunk_get_vector(in,c),r);
-        if(lua_pcall(L,(int)(nc-1),1,0)!=LUA_OK)
-            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);lua_pop(L,1);continue;}
-        if(lua_isnil(L,-1))duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);
+        if(!call_udf(fi,L,(int)(nc-1),1)){invalidate_from(out,r,nr);break;}
+        if(lua_isnil(L,-1))mark_invalid(out,r);
         else if(lua_isboolean(L,-1))od[r]=lua_toboolean(L,-1)?true:false;
         else if(lua_isnumber(L,-1))od[r]=lua_tonumber(L,-1)!=0.0;
         else od[r]=lua_toboolean(L,-1)?true:false;
         lua_pop(L,1);
     }
+    luaL_unref(L,LUA_REGISTRYINDEX,udf_ref);
     LUA_CLEANUP();
 }
 
@@ -261,9 +322,11 @@ static void fjm(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     LUA_BEGIN();
     idx_t nr=duckdb_data_chunk_get_size(in),nc=duckdb_data_chunk_get_column_count(in);
     double*od=(double*)duckdb_vector_get_data(out);
+    int udf_ref=LUA_NOREF;
+    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0));
+    if(udf_ref==LUA_NOREF){invalidate_all(out,nr);goto lua_cleanup;}
     for(idx_t r=0;r<nr;r++){
-        if(!resolve_udf(L,duckdb_data_chunk_get_vector(in,0),r))
-            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);continue;}
+        lua_rawgeti(L,LUA_REGISTRYINDEX,udf_ref);
         /* auto-cast: try as int, then as double */
         for(idx_t c=1;c<nc;c++){
             duckdb_vector v=duckdb_data_chunk_get_vector(in,c);
@@ -277,13 +340,13 @@ static void fjm(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
             else
                 push_str(L,v,r);
         }
-        if(lua_pcall(L,(int)(nc-1),1,0)!=LUA_OK)
-            {duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);lua_pop(L,1);continue;}
+        if(!call_udf(fi,L,(int)(nc-1),1)){invalidate_from(out,r,nr);break;}
         if(lua_isnil(L,-1)||!lua_isnumber(L,-1))
-            duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out),r);
+            mark_invalid(out,r);
         else od[r]=lua_tonumber(L,-1);
         lua_pop(L,1);
     }
+    luaL_unref(L,LUA_REGISTRYINDEX,udf_ref);
     LUA_CLEANUP();
 }
 
@@ -334,23 +397,41 @@ static void write_lua_to_list(lua_State *L, duckdb_vector out, duckdb_vector chi
     }
 }
 
+/* Zero the list entry (offset/length) of row r so DuckDB never reads garbage
+ * list metadata for a NULL/invalid row — a real crash source for LIST outputs. */
+static void zero_list_entry(duckdb_vector out, idx_t r) {
+    list_entry_t *e=(list_entry_t*)duckdb_vector_get_data(out);
+    e[r].offset=0; e[r].length=0;
+}
+
 static void fjl(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
     LUA_BEGIN();
     idx_t nr = duckdb_data_chunk_get_size(in), nc = duckdb_data_chunk_get_column_count(in);
     duckdb_vector oc = duckdb_list_vector_get_child(out);
+    int udf_ref=LUA_NOREF;
+    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0));
+    if(udf_ref==LUA_NOREF){
+        invalidate_all(out,nr);
+        for(idx_t i=0;i<nr;i++) zero_list_entry(out,i);
+        duckdb_list_vector_set_size(out,0);
+        goto lua_cleanup;
+    }
     for (idx_t r = 0; r < nr; r++) {
-        if (!resolve_udf(L, duckdb_data_chunk_get_vector(in, 0), r))
-            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); continue; }
+        lua_rawgeti(L,LUA_REGISTRYINDEX,udf_ref);
         for (idx_t c = 1; c < nc; c++)
             push_list_to_lua(L, duckdb_data_chunk_get_vector(in, c),
                              duckdb_list_vector_get_child(duckdb_data_chunk_get_vector(in, c)), r);
-        if (lua_pcall(L, (int)(nc - 1), 1, 0) != LUA_OK)
-            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); lua_pop(L, 1); continue; }
+        if (!call_udf(fi,L,(int)(nc-1),1)){
+            for(idx_t rr=r;rr<nr;rr++){mark_invalid(out,rr);zero_list_entry(out,rr);}
+            duckdb_list_vector_set_size(out,0);
+            break;
+        }
         if (!lua_istable(L, -1))
-            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); lua_pop(L, 1); continue; }
+            { mark_invalid(out, r); zero_list_entry(out,r); lua_pop(L, 1); continue; }
         write_lua_to_list(L, out, oc, r);
         lua_pop(L, 1);
     }
+    luaL_unref(L,LUA_REGISTRYINDEX,udf_ref);
     LUA_CLEANUP();
 }
 
@@ -417,16 +498,18 @@ static void write_lua_to_struct(lua_State *L, duckdb_vector out, idx_t row) {
 static void fjs(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
     LUA_BEGIN();
     idx_t nr = duckdb_data_chunk_get_size(in);
+    int udf_ref=LUA_NOREF;
+    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0));
+    if(udf_ref==LUA_NOREF){invalidate_all(out,nr);goto lua_cleanup;}
     for (idx_t r = 0; r < nr; r++) {
-        if (!resolve_udf(L, duckdb_data_chunk_get_vector(in, 0), r))
-            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); continue; }
+        lua_rawgeti(L,LUA_REGISTRYINDEX,udf_ref);
         push_struct_to_lua(L, duckdb_data_chunk_get_vector(in, 1), r);
-        if (lua_pcall(L, 1, 1, 0) != LUA_OK)
-            { duckdb_vector_assign_string_element(out, r, lua_tostring(L, -1)); lua_pop(L, 1); continue; }
+        if (!call_udf(fi,L,1,1)){invalidate_from(out,r,nr);break;}
         to_str(L);
         duckdb_vector_assign_string_element(out, r, lua_tostring(L, -1));
         lua_pop(L, 1);
     }
+    luaL_unref(L,LUA_REGISTRYINDEX,udf_ref);
     LUA_CLEANUP();
 }
 
@@ -469,16 +552,18 @@ static void push_map_to_lua(lua_State *L, duckdb_vector mv, idx_t r) {
 static void fjm_map(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
     LUA_BEGIN();
     idx_t nr = duckdb_data_chunk_get_size(in);
+    int udf_ref=LUA_NOREF;
+    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0));
+    if(udf_ref==LUA_NOREF){invalidate_all(out,nr);goto lua_cleanup;}
     for (idx_t r = 0; r < nr; r++) {
-        if (!resolve_udf(L, duckdb_data_chunk_get_vector(in, 0), r))
-            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); continue; }
+        lua_rawgeti(L,LUA_REGISTRYINDEX,udf_ref);
         push_map_to_lua(L, duckdb_data_chunk_get_vector(in, 1), r);
-        if (lua_pcall(L, 1, 1, 0) != LUA_OK)
-            { duckdb_validity_set_row_invalid(duckdb_vector_get_validity(out), r); lua_pop(L, 1); continue; }
+        if (!call_udf(fi,L,1,1)){invalidate_from(out,r,nr);break;}
         to_str(L);
         duckdb_vector_assign_string_element(out, r, lua_tostring(L, -1));
         lua_pop(L, 1);
     }
+    luaL_unref(L,LUA_REGISTRYINDEX,udf_ref);
     LUA_CLEANUP();
 }
 
@@ -727,6 +812,13 @@ static void mod_init_locked(duckdb_init_info info) {
 
     /* ── info mode ── */
     if(!strcmp(m,"info")){d->ok=true;d->phase="info";return;}
+
+    /* ── last_error mode: most recent Lua UDF runtime error ── */
+    if(!strcmp(m,"last_error")){
+        d->ok=true;d->phase="last_error";
+        d->msg=strdup(g_last_error?g_last_error:"(no error)");
+        return;
+    }
 
     /* ── inspect mode: show function details ── */
     if(!strcmp(m,"inspect")){

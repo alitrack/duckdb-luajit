@@ -1,7 +1,7 @@
 extension:
   name: luajit
-  description: "In-process LuaJIT UDFs for DuckDB — 12 functions, JIT-compiled, GROUP BY, batch mode ~3.6x native (single-thread)"
-  version: 0.17
+  description: "In-process LuaJIT UDFs for DuckDB — 12 functions, JIT-compiled, GC64 build, GROUP BY, batch mode ~3.6x native (single-thread)"
+  version: 0.18
   language: C
   build: cmake
   license: MIT
@@ -40,7 +40,7 @@ docs:
     - `luajit_l` / `luajit_s` / `luajit_map` — LIST/STRUCT/MAP type bridges
     - `luajit_agg` — aggregate UDFs with GROUP BY support
     - `luajit_table` — table-generating UDFs
-    - `luajit_module` — module management (10 modes)
+    - `luajit_module` — module management (12 modes incl. `last_error`)
 
     **Features:**
     - Compile + auto-type + auto-macro in one call (`quick_compile`)

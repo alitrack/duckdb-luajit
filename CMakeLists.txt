@@ -55,8 +55,8 @@ if(NOT DUCKDB_WASM_EXTENSION)
 
         add_custom_command(
             OUTPUT ${LUAJIT_LIB}
-            COMMAND ${CMAKE_COMMAND} -E env ${LUAJIT_MAKE_ENV} make -C ${LUAJIT_DIR} -j${NPROC} BUILDMODE=static XCFLAGS=-fPIC
-            COMMENT "Building LuaJIT..."
+            COMMAND ${CMAKE_COMMAND} -E env ${LUAJIT_MAKE_ENV} make -C ${LUAJIT_DIR} -j${NPROC} BUILDMODE=static XCFLAGS=-fPIC\ -DLUAJIT_ENABLE_GC64
+            COMMENT "Building LuaJIT (GC64)..."
             WORKING_DIRECTORY ${LUAJIT_DIR}
         )
     endif()
