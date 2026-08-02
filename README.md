@@ -162,6 +162,11 @@ SELECT luajit('
 - **Nested types**: LIST/STRUCT/MAP bridge via DUCKDB_TYPE_ANY
 - **Benchmark** (100K rows): luajit_i = 0.0035s, native = 0.0003s; luajit_v batch ≈ 3.6× native (single-thread)
 
+## Documentation
+
+- [Lua 能力清单](docs/lua-capabilities.md) — 在 SQL 里写 Lua 能干什么（FFI/GC64/避雷）
+- [语法层指南](docs/syntax-layers.md) — Fennel/Teal/MoonScript 编译到 Lua，零引擎成本换语法
+
 ## Build
 
 ```sh
