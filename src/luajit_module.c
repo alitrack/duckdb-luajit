@@ -1008,6 +1008,18 @@ static int load_udfs_from_file(const char *path) {
         size_t sl = strlen(source);
         while (sl > 0 && (source[sl-1] == '\n' || source[sl-1] == '\r')) source[--sl] = 0;
         if (sl == 0 || !strcmp(source, "?")) continue;
+        /* Unescape \n \t \\ (save escapes them so the tab-delimited line
+         * format survives multi-line sources). */
+        {
+            char *out = source;
+            for (char *in = source; *in; in++) {
+                if (in[0] == '\\' && in[1] == 'n') { *out++ = '\n'; in++; }
+                else if (in[0] == '\\' && in[1] == 't') { *out++ = '\t'; in++; }
+                else if (in[0] == '\\' && in[1] == '\\') { *out++ = '\\'; in++; }
+                else *out++ = *in;
+            }
+            *out = 0;
+        }
         if (luaL_loadstring(L, source) != LUA_OK) { lua_pop(L, 1); continue; }
         if (lua_pcall(L, 0, 1, 0) != LUA_OK) { lua_pop(L, 1); continue; }
         if (!lua_isfunction(L, -1)) { lua_pop(L, 1); continue; }
@@ -1419,7 +1431,16 @@ static void mod_init_locked(duckdb_init_info info) {
         LUA_LOCK();
         int n_saved=0;
         for(int i=0;i<g_udf_count;i++){
-            fprintf(fp,"%s\t%s\n",g_udf_sources[i].name,g_udf_sources[i].source);
+            /* Escape newlines/tabs/backslashes so multi-line sources survive
+             * the name<TAB>source line format (load reverses this). */
+            fprintf(fp,"%s\t",g_udf_sources[i].name);
+            for (const char *p=g_udf_sources[i].source; *p; p++){
+                if (*p=='\n') fputs("\\n",fp);
+                else if (*p=='\t') fputs("\\t",fp);
+                else if (*p=='\\') fputs("\\\\",fp);
+                else fputc(*p,fp);
+            }
+            fputc('\n',fp);
             n_saved++;
         }
         LUA_UNLOCK();
@@ -1528,6 +1549,95 @@ static void mod_init_locked(duckdb_init_info info) {
         return;
     }
 
+    /* ── fennel mode: compile Fennel source → Lua UDF (embedded compiler) ── */
+    if(!strcmp(m,"fennel")){
+        if(!d->source||!d->sql_name){d->msg=strdup("need source+sql_name");return;}
+        if (g_trusted) { d->msg=strdup("fennel unavailable in trusted mode (compiler needs require/package)"); return; }
+        L_();lua_State *L=g_lua;
+        if(!L){d->msg=strdup("no Lua");return;}
+        d->phase="fennel";
+        /* Ensure embedded fennel compiler is loaded (cached in registry) */
+        lua_getfield(L, LUA_REGISTRYINDEX, "lj_fennel");
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            extern unsigned char fennel_lua[];
+            extern unsigned int fennel_lua_len;
+            /* fennel's CLI shim scans `arg` at top level — provide an empty
+             * table so the embedded compiler loads as a library. */
+            lua_createtable(L, 0, 0);
+            lua_setglobal(L, "arg");
+            if (luaL_loadbuffer(L, (const char*)fennel_lua, fennel_lua_len, "fennel") != LUA_OK) {
+                char buf[2048];
+                snprintf(buf, sizeof(buf), "fennel loadbuffer(%u): %s", fennel_lua_len, lua_tostring(L,-1));
+                d->msg=strdup(buf);
+                lua_pop(L,1);
+                return;
+            }
+            if (lua_pcall(L, 0, 0, 0) != LUA_OK) {   /* registers package.preload entries */
+                luaL_traceback(L, L, lua_tostring(L, -1), 1);
+                lua_remove(L, -2);
+                char buf[2048];
+                snprintf(buf, sizeof(buf), "fennel chunk load: %s", lua_tostring(L, -1));
+                d->msg=strdup(buf);
+                lua_pop(L,1);
+                return;
+            }
+            lua_getglobal(L, "require");
+            lua_pushstring(L, "fennel");
+            if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+                char buf[1024];
+                snprintf(buf, sizeof(buf), "fennel require: %s", lua_tostring(L, -1));
+                d->msg=strdup(buf);
+                lua_pop(L, lua_gettop(L));
+                return;
+            }
+            lua_setfield(L, LUA_REGISTRYINDEX, "lj_fennel");
+            lua_getfield(L, LUA_REGISTRYINDEX, "lj_fennel");
+        }
+        /* stack: fennel module → compileString(source, {filename=...})
+         * NOTE: fennel.compileString is a DOT call (no self) — pushing the
+         * module as arg1 makes str = module table → "attempt to call method
+         * 'gsub' (a nil value)". Pass exactly (source, opts). */
+        lua_getfield(L, -1, "compileString");
+        lua_pushstring(L, d->source);
+        lua_createtable(L, 0, 1);
+        lua_pushstring(L, "udf.fnl");
+        lua_setfield(L, -2, "filename");
+        if (lua_pcall(L, 2, 1, 0) != LUA_OK) {
+            char buf[2048];
+            snprintf(buf, sizeof(buf), "fennel compileString: %s", lua_tostring(L,-1));
+            d->msg=strdup(buf);
+            lua_pop(L,lua_gettop(L));
+            return;
+        }
+        const char *compiled = lua_tostring(L, -1);
+        if (!compiled) {d->msg=strdup("fennel: no output");lua_pop(L,2);return;}
+        /* Compile the Fennel→Lua output as a UDF */
+        if (luaL_loadstring(L, compiled) != LUA_OK) {
+            char buf[2048];
+            snprintf(buf, sizeof(buf), "fennel output loadstring: %s", lua_tostring(L,-1));
+            d->msg=strdup(buf);
+            lua_pop(L,2);
+            return;
+        }
+        if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
+            char buf[2048];
+            snprintf(buf, sizeof(buf), "fennel output exec: %s", lua_tostring(L,-1));
+            d->msg=strdup(buf);
+            lua_pop(L,2);
+            return;
+        }
+        if (!lua_isfunction(L, -1))
+            {d->msg=strdup("fennel: must return a function");lua_pop(L,2);return;}
+        lua_setglobal(L, d->sql_name);
+        /* Store the COMPILED Lua source (other threads lazy-compile it;
+         * save/load round-trips the compiled form) */
+        udf_source_set(d->sql_name, compiled);
+        d->ok=true;d->sql_name=strdup(d->sql_name);
+        d->detail=strdup(compiled);
+        return;
+    }
+
     /* ── compile mode ── */
     if(strcmp(m,"compile")){d->msg=strdup("bad mode");return;}
     if(!d->source||!d->sql_name){d->msg=strdup("need source+sql_name");return;}
@@ -1571,7 +1681,6 @@ static void mod_func(duckdb_function_info fi, duckdb_data_chunk out) {
 }
 
 /* ── Registration ── */
-
 void luajit_register_module_functions(
     duckdb_connection conn, duckdb_extension_info ei, struct duckdb_extension_access *acc)
 {
