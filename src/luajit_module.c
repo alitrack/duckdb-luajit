@@ -1231,8 +1231,10 @@ static void mod_init_locked(duckdb_init_info info) {
                     lua_getglobal(L,"_UDF_SOURCES");
                     if(lua_istable(L,-1)){lua_getfield(L,-1,k);if(lua_isstring(L,-1))src=lua_tostring(L,-1);lua_pop(L,1);}
                     lua_pop(L,1);
-                    fprintf(fp,"%s\t%s\n",k,src);
-                    n_saved++;
+                    if(strcmp(src,"?")){  /* skip source-less globals (N5: no broken entries) */
+                        fprintf(fp,"%s\t%s\n",k,src);
+                        n_saved++;
+                    }
                 }
             }
             lua_pop(L,1);
