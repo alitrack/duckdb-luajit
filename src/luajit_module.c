@@ -29,6 +29,13 @@ void luajit_register_module_functions(
 #include <stdlib.h>
 #include <stdint.h>
 
+/* MSVC lacks __attribute__((noinline)); use __declspec(noinline) there. */
+#if defined(_MSC_VER)
+#define NOINLINE __declspec(noinline)
+#else
+#define NOINLINE __attribute__((noinline))
+#endif
+
 /* ── Thread safety: single global Lua state, guarded by a recursive mutex ──
  * DuckDB executes UDFs in parallel across threads; every Lua access must be
  * serialized. Recursive so _duckdb_call → duckdb_query → luajit UDF can re-enter.
@@ -180,8 +187,7 @@ static void invalidate_all(duckdb_vector out, idx_t n) {
  * error message into g_last_error (queryable via luajit_module mode
  * 'last_error'); the affected rows are invalidated by the caller.
  * noinline: keep the error path out of the hot loop. */
-__attribute__((noinline))
-static int call_udf(duckdb_function_info fi, lua_State *L, int nargs, int nresults) {
+static NOINLINE int call_udf(duckdb_function_info fi, lua_State *L, int nargs, int nresults) {
     (void)fi;
     if(lua_pcall(L,nargs,nresults,0)!=LUA_OK){
         const char *err=lua_tostring(L,-1);
