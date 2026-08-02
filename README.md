@@ -131,7 +131,16 @@ SELECT message FROM luajit_module(mode := 'load', source := 'my_udfs.txt');
 ## Lua → DuckDB Callback
 
 ```sql
+-- Execute SQL, returns 'ok' or 'error: <msg>'
 SELECT luajit('return _duckdb_call("CREATE TABLE log(ts TIMESTAMP DEFAULT NOW())")');
+
+-- Execute query → result table: { {col=val, ...}, ... } (nil on error)
+SELECT luajit('
+    local rows = _duckdb_query("select id, name from t order by id limit 2")
+    return rows[1].id .. "," .. rows[1].name
+');
+-- Types: integers/doubles → Lua numbers, BOOLEAN → boolean, NULL → nil
+-- Errors: returns nil + error message instead of raising (check r == nil)
 ```
 
 ## Design

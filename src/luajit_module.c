@@ -154,14 +154,75 @@ static int l_duckdb_call(lua_State *L) {
     return 1;
 }
 
+/* _duckdb_query(sql) → result_table | nil, errmsg
+ * Full result-set bridge (SPI-style, from pllua study N2): runs the query and
+ * returns { {col=val, ...}, ... } — one Lua table per row, keys = column
+ * names. Types: integer family / DOUBLE / FLOAT / BOOLEAN / VARCHAR; NULL → nil.
+ * On error returns nil + error message (catchable via pcall). */
+static int l_duckdb_query(lua_State *L) {
+    const char *sql = luaL_checkstring(L, 1);
+    if (!g_conn) { lua_pushnil(L); lua_pushstring(L, "no connection"); return 2; }
+    duckdb_result res;
+    if (duckdb_query(g_conn, sql, &res) != DuckDBSuccess) {
+        const char *err = duckdb_result_error(&res);
+        lua_pushnil(L);
+        lua_pushstring(L, err ? err : "query error");
+        duckdb_destroy_result(&res);
+        return 2;
+    }
+    /* Extension API v1.2: no result-data readers in stable surface; use the
+     * streaming fetch_chunk loop (duckdb_fetch_chunk is stable, unlike the
+     * UNSTABLE-gated row_count/column_data/get_chunk). */
+    idx_t ncols = duckdb_column_count(&res);
+    idx_t out_row = 0;
+    lua_createtable(L, 0, 0);
+    duckdb_data_chunk chunk;
+    while ((chunk = duckdb_fetch_chunk(res)) != NULL) {
+        idx_t nrows = duckdb_data_chunk_get_size(chunk);
+        for (idx_t r = 0; r < nrows; r++) {
+            lua_createtable(L, 0, (int)ncols);
+            for (idx_t c = 0; c < ncols; c++) {
+                duckdb_vector v = duckdb_data_chunk_get_vector(chunk, c);
+                duckdb_type ct = duckdb_get_type_id(duckdb_vector_get_column_type(v));
+                void *data = duckdb_vector_get_data(v);
+                uint64_t *validity = duckdb_vector_get_validity(v);
+                lua_pushstring(L, duckdb_column_name(&res, c));
+                if (validity && !duckdb_validity_row_is_valid(validity, r)) {
+                    lua_pushnil(L);
+                } else if (ct == DUCKDB_TYPE_BIGINT || ct == DUCKDB_TYPE_INTEGER ||
+                           ct == DUCKDB_TYPE_SMALLINT || ct == DUCKDB_TYPE_TINYINT ||
+                           ct == DUCKDB_TYPE_UBIGINT || ct == DUCKDB_TYPE_UINTEGER ||
+                           ct == DUCKDB_TYPE_USMALLINT || ct == DUCKDB_TYPE_UTINYINT) {
+                    lua_pushnumber(L, (lua_Number)((int64_t *)data)[r]);
+                } else if (ct == DUCKDB_TYPE_DOUBLE || ct == DUCKDB_TYPE_FLOAT) {
+                    lua_pushnumber(L, ((double *)data)[r]);
+                } else if (ct == DUCKDB_TYPE_BOOLEAN) {
+                    lua_pushboolean(L, ((bool *)data)[r]);
+                } else if (ct == DUCKDB_TYPE_VARCHAR) {
+                    duckdb_string_t s = ((duckdb_string_t *)data)[r];
+                    lua_pushlstring(L, duckdb_string_t_data(&s), duckdb_string_t_length(s));
+                } else {
+                    lua_pushstring(L, "(unsupported type)");
+                }
+                lua_rawset(L, -3);  /* t[colname] = value */
+            }
+            lua_rawseti(L, -2, (int)(++out_row));
+        }
+    }
+    duckdb_destroy_result(&res);
+    return 1;
+}
+
 static void L_(void) {
     if (!g_lua) {
         g_lua = luaL_newstate();
         if (g_lua) {
             luaL_openlibs(g_lua);
-            /* register DuckDB callback */
+            /* register DuckDB callbacks */
             lua_pushcfunction(g_lua, l_duckdb_call);
             lua_setglobal(g_lua, "_duckdb_call");
+            lua_pushcfunction(g_lua, l_duckdb_query);
+            lua_setglobal(g_lua, "_duckdb_query");
         }
     }
 }
