@@ -1,7 +1,7 @@
 extension:
   name: luajit
-  description: "In-process LuaJIT UDFs for DuckDB — 12 functions, JIT-compiled, GC64 build, GROUP BY, batch mode ~3.6x native (single-thread)"
-  version: 0.18
+  description: "In-process LuaJIT UDFs for DuckDB — 16 functions, trusted sandbox mode, _duckdb_query bridge, GC64, GROUP BY, batch mode ~3.6x native (single-thread)"
+  version: 0.19
   language: C
   build: cmake
   license: MIT

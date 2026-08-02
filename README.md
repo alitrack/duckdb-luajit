@@ -1,12 +1,16 @@
-# luajit — DuckDB LuaJIT UDF Extension  v0.18
+# luajit — DuckDB LuaJIT UDF Extension  v0.19
 
 Self-contained DuckDB extension for Lua expressions, JIT-compiled UDFs, and nested type bridges via LuaJIT. ~700KB, MIT licensed.
 
-> **v0.18 changes**: LuaJIT built with **GC64** (2GB memory wall removed), UDF
-> resolution moved from per-row to per-chunk (registry refs — ~6× faster
-> row-mode UDFs), runtime Lua errors now queryable via
-> `luajit_module(mode:='last_error')`, and a crash fix for LIST outputs when
-> the UDF name is undefined.
+> **v0.19 changes**: trusted sandbox mode; `_duckdb_query` result-set bridge;
+> DATE/TIMESTAMP/DECIMAL/HUGEINT bridging; streaming `luajit_table` generator
+> mode; chunk-batched BIGINT/VARCHAR UDFs (`luajit_vi`/`luajit_vs`); LIST bridge
+> NULL elements + BOOLEAN children; MSVC build fix.
+>
+> **v0.18 changes**: GC64 enabled (2GB memory wall removed); UDF resolution
+> moved from per-row to per-chunk (registry refs — ~6× faster row-mode UDFs);
+> runtime Lua errors queryable via `luajit_module(mode:='last_error')`; crash
+> fix for LIST outputs when the UDF name is undefined.
 
 ## Quick Start
 
