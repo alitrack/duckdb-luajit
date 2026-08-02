@@ -33,6 +33,9 @@ SELECT add(3, 4);  -- 7  (auto-macro → luajit_i)
 | `luajit_f(name, a..)` | DOUBLE → DOUBLE | `SELECT luajit_f('sqrt', 9.0)` → 3.0 |
 | `luajit_b(name, a..)` | BOOLEAN → BOOLEAN | `SELECT luajit_b('all', true, false)` → false |
 | `luajit_m(name, a..)` | ANY → DOUBLE | `SELECT luajit_m('sum', 1, 2.5, 3)` → 6.5 |
+| `luajit_v(name, a..)` | DOUBLE 列批量 | `SELECT luajit_v('dblv', x)` — 1 Lua 调用/chunk，UDF 收整列 table 返 table |
+| `luajit_vi(name, a..)` | BIGINT 列批量 | `SELECT luajit_vi('dblv', x)` — int64 版批量 |
+| `luajit_vs(name, a..)` | VARCHAR 列批量 | `SELECT luajit_vs('upv', name)` — string 版批量 |
 | `luajit_l(name, a..)` | LIST → LIST(DOUBLE) | `SELECT luajit_l('top2', [3,1,4,2])` → `[4.0,3.0]` |
 | `luajit_s(name, s)` | STRUCT → VARCHAR | `SELECT luajit_s('fmt', {x:3, y:4})` → `'x=3 y=4'` |
 | `luajit_map(name, m)` | MAP → VARCHAR | `SELECT luajit_map('fmt', map{'a':1})` → `'a=1'` |
@@ -125,7 +128,7 @@ SELECT luajit('return _duckdb_call("CREATE TABLE log(ts TIMESTAMP DEFAULT NOW())
 ## Design
 
 - **LuaJIT 2.1** (MIT, **GC64 build**): ~700KB, self-contained, trace-based JIT
-- **12 functions**: 8 scalar, 1 aggregate (GROUP BY), 1 table, 1 module
+- **14 functions**: 10 scalar (3 chunk-batched), 1 aggregate (GROUP BY), 1 table, 1 module
 - **12 modes**: info, last_error, compile, quick_compile, inspect, macro, list, drop, reset, save, load
 - **Per-group state**: aggregate uses state-pointer-keyed array (256 max groups)
 - **Per-type executors**: specialized callbacks for each DuckDB type, UDF resolved once per chunk (registry ref)

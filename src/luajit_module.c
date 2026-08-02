@@ -301,6 +301,90 @@ static void fjv(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     LUA_CLEANUP();
 }
 
+/* luajit_vi(name, ...BIGINT) → BIGINT  — chunk-batched: 1 Lua call per chunk.
+ * Same batch pattern as luajit_v but for int64 columns: UDF receives
+ * {val_1..val_nr} tables, returns a table of results. */
+static void fjvi(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
+    LUA_BEGIN();
+    idx_t nr = duckdb_data_chunk_get_size(in);
+    idx_t nc = duckdb_data_chunk_get_column_count(in);
+    if (nr == 0 || nc < 2) goto lua_cleanup;
+
+    int64_t *od = (int64_t *)duckdb_vector_get_data(out);
+
+    int udf_ref = resolve_udf_chunk(L, duckdb_data_chunk_get_vector(in, 0));
+    if (udf_ref == LUA_NOREF) { invalidate_all(out, nr); goto lua_cleanup; }
+
+    int nargs = (int)(nc - 1);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, udf_ref);
+    for (int c = 1; c < (int)nc; c++) {
+        lua_createtable(L, (int)nr, 0);
+        duckdb_vector v = duckdb_data_chunk_get_vector(in, (idx_t)c);
+        int64_t *d = (int64_t *)duckdb_vector_get_data(v);
+        for (idx_t r = 0; r < nr; r++) {
+            lua_pushinteger(L, (lua_Integer)d[r]);
+            lua_rawseti(L, -2, (int)(r + 1));
+        }
+    }
+
+    if (!call_udf(fi, L, nargs, 1)) { luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
+    if (!lua_istable(L, -1)) { lua_pop(L, lua_gettop(L)); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
+
+    idx_t rlen = (idx_t)lua_objlen(L, -1);
+    for (idx_t r = 0; r < nr && r < rlen; r++) {
+        lua_rawgeti(L, -1, (int)(r + 1));
+        if (lua_isnil(L, -1)) mark_invalid(out, r);
+        else od[r] = lua_isnumber(L, -1) ? (int64_t)lua_tointeger(L, -1) : 0;
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+    luaL_unref(L, LUA_REGISTRYINDEX, udf_ref);
+    LUA_CLEANUP();
+}
+
+/* luajit_vs(name, ...VARCHAR) → VARCHAR  — chunk-batched for strings.
+ * UDF receives {s1..snr} tables, returns a table of strings/nils. */
+static void fjvs(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
+    LUA_BEGIN();
+    idx_t nr = duckdb_data_chunk_get_size(in);
+    idx_t nc = duckdb_data_chunk_get_column_count(in);
+    if (nr == 0 || nc < 2) goto lua_cleanup;
+
+    int udf_ref = resolve_udf_chunk(L, duckdb_data_chunk_get_vector(in, 0));
+    if (udf_ref == LUA_NOREF) { invalidate_all(out, nr); goto lua_cleanup; }
+
+    int nargs = (int)(nc - 1);
+    lua_rawgeti(L, LUA_REGISTRYINDEX, udf_ref);
+    for (int c = 1; c < (int)nc; c++) {
+        lua_createtable(L, (int)nr, 0);
+        duckdb_vector v = duckdb_data_chunk_get_vector(in, (idx_t)c);
+        duckdb_string_t *d = (duckdb_string_t *)duckdb_vector_get_data(v);
+        for (idx_t r = 0; r < nr; r++) {
+            if (!duckdb_validity_row_is_valid(duckdb_vector_get_validity(v), r)) {
+                lua_pushnil(L);
+            } else {
+                duckdb_string_t s = d[r];
+                lua_pushlstring(L, duckdb_string_t_data(&s), duckdb_string_t_length(s));
+            }
+            lua_rawseti(L, -2, (int)(r + 1));
+        }
+    }
+
+    if (!call_udf(fi, L, nargs, 1)) { luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
+    if (!lua_istable(L, -1)) { lua_pop(L, lua_gettop(L)); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
+
+    idx_t rlen = (idx_t)lua_objlen(L, -1);
+    for (idx_t r = 0; r < nr && r < rlen; r++) {
+        lua_rawgeti(L, -1, (int)(r + 1));
+        if (lua_isnil(L, -1)) mark_invalid(out, r);
+        else duckdb_vector_assign_string_element(out, r, lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+    luaL_unref(L, LUA_REGISTRYINDEX, udf_ref);
+    LUA_CLEANUP();
+}
+
 /* luajit_b(name, ...BOOLEAN) → BOOLEAN */
 static void fjb(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
     LUA_BEGIN();
@@ -1122,6 +1206,8 @@ void luajit_register_module_functions(
     REG("luajit_b", fjb, DUCKDB_TYPE_BOOLEAN) VARGS(DUCKDB_TYPE_BOOLEAN) END();
     REG("luajit_m", fjm, DUCKDB_TYPE_DOUBLE)  VARGS(DUCKDB_TYPE_DOUBLE)  END();
     REG("luajit_v", fjv, DUCKDB_TYPE_DOUBLE)  VARGS(DUCKDB_TYPE_DOUBLE)  END();
+    REG("luajit_vi", fjvi, DUCKDB_TYPE_BIGINT) VARGS(DUCKDB_TYPE_BIGINT) END();
+    REG("luajit_vs", fjvs, DUCKDB_TYPE_VARCHAR) VARGS(DUCKDB_TYPE_VARCHAR) END();
 
     /* luajit_l: LIST(BIGINT) args → LIST(DOUBLE) return */
     { duckdb_scalar_function f = duckdb_create_scalar_function();
