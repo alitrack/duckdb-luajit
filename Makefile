@@ -26,8 +26,10 @@ test: test_debug
 test_debug: test_extension_debug
 test_release: test_extension_release
 
-# Skip SQLLogicTests — luajit_module init fails on macOS arm64 (LuaJIT runtime)
-SKIP_TESTS=1
+# SQLLogicTests: skipped by default — luajit_module init fails on macOS arm64
+# (LuaJIT runtime). Enable with SKIP_TESTS=0; luajit_bridge.test carries a
+# skipif: macos_arm64 header so CI runs it everywhere else.
+SKIP_TESTS ?= 1
 
 clean: clean_build clean_cmake
 clean_all: clean clean_configure

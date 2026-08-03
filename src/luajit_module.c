@@ -861,6 +861,18 @@ static void fjl(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     }
     for (idx_t r = 0; r < nr; r++) {
         lua_rawgeti(L,LUA_REGISTRYINDEX,udf_ref);
+        /* Pre-check: every vararg must be a LIST (LIST(ANY) signature lets
+         * scalars bind too — reject them here instead of misreading data). */
+        bool bad = false;
+        for (idx_t c = 1; c < nc && !bad; c++)
+            if (duckdb_get_type_id(duckdb_vector_get_column_type(
+                    duckdb_data_chunk_get_vector(in, c))) != DUCKDB_TYPE_LIST)
+                bad = true;
+        if (bad) {
+            lua_pop(L, 1);
+            mark_invalid(out, r); zero_list_entry(out, r);
+            continue;
+        }
         for (idx_t c = 1; c < nc; c++)
             push_list_to_lua(L, duckdb_data_chunk_get_vector(in, c),
                              duckdb_list_vector_get_child(duckdb_data_chunk_get_vector(in, c)), r);
@@ -1306,7 +1318,6 @@ static void tbt_init(duckdb_init_info info) {
     if (d && d->source) {
         L_(); lua_State *L = g_lua;
         if (!L) { LUA_UNLOCK(); return; }
-
         /* Try compiled UDF first, then inline source */
         lua_getglobal(L, d->source);
         if (!lua_isfunction(L, -1)) {
@@ -1315,16 +1326,20 @@ static void tbt_init(duckdb_init_info info) {
             if (luaL_loadstring(L, d->source) != LUA_OK) { lua_pop(L, 1); LUA_UNLOCK(); return; }
             if (lua_pcall(L, 0, 1, 0) != LUA_OK) { lua_pop(L, 1); LUA_UNLOCK(); return; }
         }
-        /* Now call the function (compiled or inline) */
-        if (!lua_isfunction(L, -1)) { lua_pop(L, 1); LUA_UNLOCK(); return; }
-        if (lua_pcall(L, 0, 1, 0) != LUA_OK) { lua_pop(L, 1); LUA_UNLOCK(); return; }
-
-        /* Generator mode: UDF returned a function (coroutine.wrap iterator) —
-         * stream rows via coroutine.resume per chunk instead of materializing. */
-        if (lua_isfunction(L, -1)) {
+        /* Result dispatch (executed source is on the stack):
+         *  - C function (coroutine.wrap iterator) → streaming generator mode
+         *    (must check BEFORE calling — pcall on the iterator would consume
+         *    the first yield and the generator would never be registered)
+         *  - plain Lua function → call once, expect a table (README table form:
+         *    'return function() local t={} ... return t end')
+         *  - table → materialize rows */
+        if (lua_isfunction(L, -1) && lua_iscfunction(L, -1)) {
             s->gen_ref = luaL_ref(L, LUA_REGISTRYINDEX);
             LUA_UNLOCK();
             return;
+        }
+        if (lua_isfunction(L, -1)) {
+            if (lua_pcall(L, 0, 1, 0) != LUA_OK) { lua_pop(L, 1); LUA_UNLOCK(); return; }
         }
         if (!lua_istable(L, -1)) { lua_pop(L, 1); LUA_UNLOCK(); return; }
 
@@ -1332,10 +1347,19 @@ static void tbt_init(duckdb_init_info info) {
         s->nrows = n;
         s->rows = (char **)duckdb_malloc(n * sizeof(char *));
         for (int i = 0; i < n; i++) {
-            lua_rawgeti(L, -1, i + 1);
-            to_str(L);
+            lua_rawgeti(L, -1, i + 1);           /* stack: [result, elem] */
+            if (lua_isnil(L, -1)) {
+                s->rows[i] = strdup("");
+                lua_pop(L, 1);
+                continue;
+            }
+            if (!lua_isstring(L, -1)) {
+                to_str(L);                       /* stack: [result, elem, str] */
+                lua_remove(L, -2);               /* replace elem → [result, str] */
+            }
+            /* string elem: to_str is a no-op, stack is already [result, elem] */
             s->rows[i] = strdup(lua_tostring(L, -1));
-            lua_pop(L, 1);
+            lua_pop(L, 1);                       /* [result] */
         }
         lua_pop(L, 1); /* pop result table */
     }
@@ -1365,6 +1389,12 @@ static void tbt_func(duckdb_function_info fi, duckdb_data_chunk out) {
             return;
         }
         if (lua_isnil(L, -2)) {  /* generator exhausted */
+            lua_pop(L, 2);
+            LUA_UNLOCK();
+            duckdb_data_chunk_set_size(out, 0);
+            return;
+        }
+        if (!lua_isnumber(L, -2)) {  /* non-iterator function safety: stop the stream */
             lua_pop(L, 2);
             LUA_UNLOCK();
             duckdb_data_chunk_set_size(out, 0);
@@ -1565,7 +1595,8 @@ static void mod_init_locked(duckdb_init_info info) {
             else if(!strcmp(d->source,"b")||!strcmp(d->source,"BOOLEAN"))var="b";
             else if(!strcmp(d->source,"m")||!strcmp(d->source,"MIXED"))var="m";
         }
-        const char *fn=*var=='i'?"luajit_i":*var=='f'?"luajit_f":*var=='b'?"luajit_b":*var=='m'?"luajit_m":"luajit";
+        const char *fn=*var=='i'?"luajit_i":*var=='f'?"luajit_f":*var=='b'?"luajit_b":*var=='m'?"luajit_m":"luajit_vs";
+        int vstr=(*var=='v');
         char buf[4096];int off=snprintf(buf,sizeof(buf),"CREATE OR REPLACE MACRO %s(",d->sql_name);
         int nargs=2;
         L_();lua_State *L=g_lua;lua_getglobal(L,d->sql_name);
@@ -1580,7 +1611,8 @@ static void mod_init_locked(duckdb_init_info info) {
         for(int i=0;i<nargs;i++)off+=snprintf(buf+off,sizeof(buf)-off,"%sx%d",i>0?", ":"",i+1);
         off+=snprintf(buf+off,sizeof(buf)-off,") AS %s('",fn);
         off+=snprintf(buf+off,sizeof(buf)-off,"%s'",d->sql_name);
-        for(int i=0;i<nargs;i++)off+=snprintf(buf+off,sizeof(buf)-off,", x%d",i+1);
+        for(int i=0;i<nargs;i++)
+            off+=snprintf(buf+off,sizeof(buf)-off, vstr?", CAST(x%d AS VARCHAR)":", x%d",i+1);
         snprintf(buf+off,sizeof(buf)-off,")");
         d->ok=true;d->phase="macro";d->detail=strdup(buf);d->sql_name=strdup(d->sql_name);
         return;
@@ -1629,14 +1661,34 @@ static void mod_init_locked(duckdb_init_info info) {
         lua_setglobal(L,d->sql_name);
         /* P4: register in shared table (other threads compile lazily) */
         udf_source_set(d->sql_name, d->source);
-        /* Step 5: generate macro DDL */
-        const char *fn=*var=='i'?"luajit_i":*var=='f'?"luajit_f":*var=='b'?"luajit_b":"luajit";
+        /* Step 5: generate + EXECUTE macro DDL so the name is callable.
+         * Return-type mapping: i→luajit_i, f→luajit_f, b→luajit_b,
+         * v→luajit_vs (VARCHAR batch; args CAST to VARCHAR since luajit_vs
+         * takes VARCHAR columns). Previously the DDL was only stored in
+         * detail and never executed → "function does not exist" on call. */
+        const char *fn=*var=='i'?"luajit_i":*var=='f'?"luajit_f":*var=='b'?"luajit_b":"luajit_vs";
+        int vstr=(*var=='v');
         char buf[2048];int off=snprintf(buf,sizeof(buf),"CREATE OR REPLACE MACRO %s(",d->sql_name);
         for(int i=0;i<np;i++)off+=snprintf(buf+off,sizeof(buf)-off,"%sx%d",i>0?", ":"",i+1);
         off+=snprintf(buf+off,sizeof(buf)-off,") AS %s('",fn);
         off+=snprintf(buf+off,sizeof(buf)-off,"%s'",d->sql_name);
-        for(int i=0;i<np;i++)off+=snprintf(buf+off,sizeof(buf)-off,", x%d",i+1);
+        for(int i=0;i<np;i++)
+            off+=snprintf(buf+off,sizeof(buf)-off, vstr?", CAST(x%d AS VARCHAR)":", x%d",i+1);
         snprintf(buf+off,sizeof(buf)-off,")");
+        if (g_conn) {
+            LUA_LOCK();
+            duckdb_result rres;
+            duckdb_state st = duckdb_query(g_conn, buf, &rres);
+            if (st != DuckDBSuccess) {
+                const char *err = duckdb_result_error(&rres);
+                d->msg = strdup(err ? err : "macro create failed");
+                duckdb_destroy_result(&rres);
+                LUA_UNLOCK();
+                return;
+            }
+            duckdb_destroy_result(&rres);
+            LUA_UNLOCK();
+        }
 
         d->ok=true;d->sql_name=strdup(d->sql_name);d->detail=strdup(buf);
         return;
@@ -1806,7 +1858,9 @@ void luajit_register_module_functions(
     REG("luajit_vi", fjvi, DUCKDB_TYPE_BIGINT) VARGS(DUCKDB_TYPE_BIGINT) END();
     REG("luajit_vs", fjvs, DUCKDB_TYPE_VARCHAR) VARGS(DUCKDB_TYPE_VARCHAR) END();
 
-    /* luajit_l: LIST(BIGINT) args → LIST(DOUBLE) return */
+    /* luajit_l: LIST(ANY) args → LIST(DOUBLE) return. ANY child type lets
+     * BIGINT[]/DOUBLE[]/DECIMAL[]/INTEGER[] all bind; push_list_to_lua
+     * dispatches on the actual child type at runtime. */
     { duckdb_scalar_function f = duckdb_create_scalar_function();
       duckdb_scalar_function_set_name(f, "luajit_l");
       duckdb_scalar_function_set_function(f, fjl);
@@ -1814,7 +1868,7 @@ void luajit_register_module_functions(
       duckdb_scalar_function_set_return_type(f, rt);
       duckdb_destroy_logical_type(&rt);
       duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-      duckdb_logical_type at = duckdb_create_list_type(duckdb_create_logical_type(DUCKDB_TYPE_BIGINT));
+      duckdb_logical_type at = duckdb_create_list_type(duckdb_create_logical_type(DUCKDB_TYPE_ANY));
       duckdb_scalar_function_set_varargs(f, at);
       duckdb_destroy_logical_type(&at);
       duckdb_register_scalar_function(conn, f);

@@ -1,0 +1,161 @@
+# name: test/sql/luajit_bridge.test
+# description: Type bridges (STRUCT/LIST), quick_compile macros, and FFI-adjacent semantics
+# group: [luajit]
+# skipif: macos_arm64
+
+require luajit
+
+statement ok
+SELECT 1
+
+# ── quick_compile macros: DDL is executed, name is immediately callable ──
+
+statement ok
+SELECT message FROM luajit_module(mode := 'quick_compile', sql_name := 'add',
+  source := 'return function(a, b) return a + b end')
+
+query I
+SELECT add(3, 4)
+----
+7
+
+query I
+SELECT add(-1, 2)
+----
+1
+
+# VARCHAR-returning macro → luajit_vs with CAST args (integer & double params)
+
+statement ok
+SELECT message FROM luajit_module(mode := 'quick_compile', sql_name := 'moneyfmt',
+  source := 'return function(t) local out = {} for i = 1, #t do local cents = tonumber(t[i]) local sign = "" if cents < 0 then sign = "-" cents = -cents end local y = math.floor(cents / 100) local f = cents % 100 out[i] = sign .. tostring(y) .. "." .. string.format("%02d", f) end return out end')
+
+query T
+SELECT moneyfmt(123456789)
+----
+1234567.89
+
+query T
+SELECT moneyfmt(123456789.50::DOUBLE)
+----
+1234567.89
+
+query T
+SELECT moneyfmt(-50)
+----
+-0.50
+
+# ── STRUCT bridge: DECIMAL children, negative ints, nesting, NULL ──
+
+statement ok
+SELECT message FROM luajit_module(mode := 'quick_compile', sql_name := 's2',
+  source := 'return function(a) return tostring(a.x) .. "|" .. tostring(a.y) end')
+
+# DECIMAL literal (3.0 is DECIMAL(2,1), not DOUBLE) — was silently nil pre-0.21
+# (Lua tostring(3.0) == "3")
+query T
+SELECT luajit_s('s2', {x:3.0, y:4.0})
+----
+3|4
+
+# negative INTEGER child — was read as unsigned (4294967292) pre-0.21
+query T
+SELECT luajit_s('s2', {x:3, y:-4})
+----
+3|-4
+
+query T
+SELECT luajit_s('s2', {x:3::SMALLINT, y:-4::SMALLINT})
+----
+3|-4
+
+# NULL child → nil
+statement ok
+SELECT message FROM luajit_module(mode := 'quick_compile', sql_name := 's3',
+  source := 'return function(a) return (a.x ~= nil and tostring(a.x) or "nil") end')
+
+query T
+SELECT luajit_s('s3', {x:NULL})
+----
+nil
+
+# nested STRUCT + DECIMAL children — recursive bridge (v0.21)
+statement ok
+SELECT message FROM luajit_module(mode := 'quick_compile', sql_name := 'cadd',
+  source := 'return function(p) local a, b = p.a, p.b local re = a.re + b.re local im = a.im + b.im return tostring(re) .. "+" .. tostring(im) .. "i" end')
+
+query T
+SELECT luajit_s('cadd', {a:{re:1.5, im:2.5}, b:{re:3.25, im:4.75}})
+----
+4.75+7.25i
+
+# ── LIST bridge: any child type binds (LIST(ANY) signature) ──
+
+statement ok
+SELECT message FROM luajit_module(mode := 'quick_compile', sql_name := 'suml',
+  source := 'return function(t) local s = 0 for i = 1, #t do s = s + t[i] end return {s} end')
+
+# DECIMAL[] — binder error pre-0.22 (signature was BIGINT[] only)
+query T
+SELECT luajit_l('suml', [1.5, 2.5, 3.0])
+----
+[7.0]
+
+# INTEGER[] auto-cast
+query T
+SELECT luajit_l('suml', [1, 2, 3])
+----
+[6.0]
+
+# scalar arg rejected at bind time
+statement error
+SELECT luajit_l('suml', 5)
+----
+Binder Error
+
+# ── Lunar calendar: 8-anchor algorithm, spot-check leap years ──
+
+statement ok
+SELECT message FROM luajit_module(mode := 'quick_compile', sql_name := 'lunar',
+  source := 'return function(t) local lunarInfo = {0x04bd8,0x04ae0,0x0a570,0x054d5,0x0d260,0x0d950,0x16554,0x056a0,0x09ad0,0x055d2,0x04ae0,0x0a5b6,0x0a4d0,0x0d250,0x1d255,0x0b540,0x0d6a0,0x0ada2,0x095b0,0x14977,0x04970,0x0a4b0,0x0b4b5,0x06a50,0x06d40,0x1ab54,0x02b60,0x09570,0x052f2,0x04970,0x06566,0x0d4a0,0x0ea50,0x06e95,0x05ad0,0x02b60,0x186e3,0x092e0,0x1c8d7,0x0c950,0x0d4a0,0x1d8a6,0x0b550,0x056a0,0x1a5b4,0x025d0,0x092d0,0x0d2b2,0x0a950,0x0b557,0x06ca0,0x0b550,0x15355,0x04da0,0x0a5b0,0x14573,0x052b0,0x0a9a8,0x0e950,0x06aa0,0x0aea6,0x0ab50,0x04b60,0x0aae4,0x0a570,0x05260,0x0f263,0x0d950,0x05b57,0x056a0,0x096d0,0x04dd5,0x04ad0,0x0a4d0,0x0d4d4,0x0d250,0x0d558,0x0b540,0x0b5a0,0x195a6,0x095b0,0x049b0,0x0a974,0x0a4b0,0x0b27a,0x06a50,0x06d40,0x0af46,0x0ab60,0x09570,0x04af5,0x04970,0x064b0,0x074a3,0x0ea50,0x06b58,0x055c0,0x0ab60,0x096d5,0x092e0,0x0c960,0x0d954,0x0d4a0,0x0da50,0x07552,0x056a0,0x0abb7,0x025d0,0x092d0,0x0cab5,0x0a950,0x0b4a0,0x0baa4,0x0ad50,0x055d9,0x04ba0,0x0a5b0,0x15176,0x052b0,0x0a930,0x07954,0x06aa0,0x0ad50,0x05b52,0x04b60,0x0a6e6,0x0a4e0,0x0d260,0x0ea65,0x0d530,0x05aa0,0x076a3,0x096d0,0x04afb,0x04ad0,0x0a4d0,0x1d0b6,0x0d250,0x0d520,0x0dd45,0x0b5a0,0x056d0,0x055b2,0x049b0,0x0a577,0x0a4b0,0x0aa50,0x1b255,0x06d20,0x0ada0,0x14b63,0x09370,0x049f8,0x04970,0x064b0,0x168a6,0x0ea50,0x06b20,0x1a6c4,0x0aae0,0x0a2e0,0x0d2e3,0x0c960,0x0d557,0x0d4a0,0x0da50,0x05d55,0x056a0,0x0a6d0,0x055d4,0x052d0,0x0a9b8,0x0a950,0x0b4a0,0x0b6a6,0x0ad50,0x055a0,0x0aba4,0x0a5b0,0x052b0,0x0b273,0x06930,0x07337,0x06aa0,0x0ad50,0x14b55,0x04b60,0x0a570,0x054e4,0x0d160,0x0e968,0x0d520,0x0daa0,0x16aa6,0x056d0,0x04ae0,0x0a9d4,0x0a2d0,0x0d150,0x0f252,0x0d520} local function leapMonth(y) return bit.band(lunarInfo[y-1899], 15) end local function leapDays(y) local lm = leapMonth(y) if lm ~= 0 then return (bit.band(lunarInfo[y-1899], 65536) ~= 0) and 30 or 29 end return 0 end local function monthDays(y, m) return (bit.band(lunarInfo[y-1899], bit.lshift(1, 16 - m)) ~= 0) and 30 or 29 end local function lYearDays(y) local s = 348 for m = 1, 12 do if bit.band(lunarInfo[y-1899], bit.lshift(1, 16 - m)) ~= 0 then s = s + 1 end end return s + leapDays(y) end local function isLeapYear(y) return (y % 4 == 0 and y % 100 ~= 0) or y % 400 == 0 end local mdays = {31,28,31,30,31,30,31,31,30,31,30,31} local function totalDays(y, m, d) local n = 0 for yy = 1900, y - 1 do n = n + 365 + (isLeapYear(yy) and 1 or 0) end for mm = 1, m - 1 do n = n + mdays[mm] end if m > 2 and isLeapYear(y) then n = n + 1 end return n + d - 1 end local mStr = {"正","二","三","四","五","六","七","八","九","十","冬","腊"} local dStr = {"初一","初二","初三","初四","初五","初六","初七","初八","初九","初十","十一","十二","十三","十四","十五","十六","十七","十八","十九","二十","廿一","廿二","廿三","廿四","廿五","廿六","廿七","廿八","廿九","三十"} local out = {} for n = 1, #t do local y, m, d = t[n]:match("(%d+)-(%d+)-(%d+)") y, m, d = tonumber(y), tonumber(m), tonumber(d) local offset = totalDays(y, m, d) - 30 local i = 1900 local temp = 0 while i < 2101 and offset > 0 do temp = lYearDays(i) offset = offset - temp i = i + 1 end if offset < 0 then offset = offset + temp i = i - 1 end local year = i local leap = leapMonth(i) local isLeap = false i = 1 temp = 0 while i < 13 and offset > 0 do if leap ~= 0 and i == leap + 1 and not isLeap then i = i - 1 isLeap = true temp = leapDays(year) else temp = monthDays(year, i) end if isLeap and i == leap + 1 then isLeap = false end offset = offset - temp i = i + 1 end if offset == 0 and leap ~= 0 and i == leap + 1 then if isLeap then isLeap = false else isLeap = true i = i - 1 end end if offset < 0 then offset = offset + temp i = i - 1 end local lm = i out[n] = year .. "年" .. (isLeap and "闰" or "") .. mStr[lm] .. "月" .. dStr[offset + 1] end return out end')
+
+# plain year
+query T
+SELECT luajit_vs('lunar', '2024-02-10')
+----
+2024年正月初一
+
+# leap-month year (2023 闰二月)
+query T
+SELECT luajit_vs('lunar', '2023-03-22')
+----
+2023年闰二月初一
+
+# ── aggregate + table function smoke ──
+
+statement ok
+SELECT message FROM luajit_module(mode := 'quick_compile', sql_name := 'mysum',
+  source := 'return function(v) local s=0;for i=1,#v do s=s+v[i] end;return s end')
+
+query I
+SELECT luajit_agg('mysum', x) FROM (VALUES (1),(2),(3)) t(x)
+----
+6
+
+statement ok
+SELECT message FROM luajit_module(mode := 'quick_compile', sql_name := 'gen3',
+  source := 'return function() return { {1, "a"}, {2, "b"}, {3, "c"} } end')
+
+query II
+SELECT * FROM luajit_table('return function() return { "a", "b", "c" } end')
+----
+1	a
+2	b
+3	c
+
+# generator (coroutine.wrap) streams rows
+query II
+SELECT * FROM luajit_table('return coroutine.wrap(function() coroutine.yield(10, "x") coroutine.yield(20, "y") end)')
+----
+10	x
+20	y

@@ -2,6 +2,13 @@
 
 Self-contained DuckDB extension for Lua expressions, JIT-compiled UDFs, and nested type bridges via LuaJIT. ~700KB, MIT licensed.
 
+> **v0.22 changes**: quick_compile macros now EXECUTE the DDL (name callable
+> immediately) and VARCHAR-returning UDFs map to `luajit_vs` with CAST args.
+> `luajit_l` accepts any LIST child type (`LIST(ANY)`), not just BIGINT[].
+> luajit_table fixed: materialize stack management (string/nested-table/nil
+> rows), coroutine.wrap generators no longer consumed by the probe call.
+> SQLLogicTests enabled (`luajit_bridge.test`, 27 assertions).
+>
 > **v0.21 changes**: STRUCT bridge — DECIMAL children (any width, 1.5 not
 > silently nil), true element-width reads for all int types (INTEGER/SMALLINT/
 > TINYINT + unsigned family; negative values no longer read as huge unsigned),

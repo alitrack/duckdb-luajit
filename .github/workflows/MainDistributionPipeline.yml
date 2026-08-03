@@ -22,7 +22,7 @@ jobs:
       ci_tools_version: v1.5-variegata
       extension_name: luajit
       extra_toolchains: python3
-      skip_tests: true
+      skip_tests: false
       exclude_archs: 'linux_arm64;wasm_eh;wasm_mvp;wasm_threads;windows_amd64_mingw;windows_amd64_rtools'
 
   release:
