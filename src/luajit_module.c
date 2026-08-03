@@ -81,6 +81,18 @@ static void lua_lock_init(void) {
 #endif
 
 static LUA_TLS lua_State *g_lua = NULL;
+/* Generator (coroutine.wrap) mode uses a SHARED non-TLS state: gen_ref is
+ * registered in the init thread's TLS state, but tbt_func can run on a
+ * different thread whose TLS state has a different registry → cross-state
+ * lookup returns nil → intermittent 0 rows (local ~10%, stable on v1.5.5
+ * CI). Moving the iterator to one shared state fixes it. */
+static lua_State *g_tbt_lua = NULL;
+static void TBT_L_(void) {
+    if (!g_tbt_lua) {
+        g_tbt_lua = luaL_newstate();
+        if (g_tbt_lua) luaL_openlibs(g_tbt_lua);
+    }
+}
 static duckdb_connection g_conn = NULL;
 /* Last Lua UDF runtime error — set/read under LUA_LOCK. We do NOT use
  * duckdb_function_set_error: on DuckDB 1.2.0 the CFunctionInfo error string
@@ -1344,15 +1356,15 @@ typedef struct { char *source; } tbt_data_t;
  * coroutine.wrap iterator resumed per chunk (streaming, O(1) memory). */
 typedef struct {
     int cur_row; char **rows; int nrows;
-    int gen_ref;
+    int gen_ref;   /* coroutine.wrap iterator in the shared g_tbt_lua state */
 } tbt_state_t;
 
 static void tbt_state_free(void *p) {
     tbt_state_t *s = (tbt_state_t *)p;
     if (s) {
-        if (s->gen_ref != LUA_NOREF && g_lua) {
+        if (s->gen_ref != LUA_NOREF && g_tbt_lua) {
             LUA_LOCK();
-            luaL_unref(g_lua, LUA_REGISTRYINDEX, s->gen_ref);
+            luaL_unref(g_tbt_lua, LUA_REGISTRYINDEX, s->gen_ref);
             LUA_UNLOCK();
         }
         if (s->rows) duckdb_free(s->rows);
@@ -1401,7 +1413,13 @@ static void tbt_init(duckdb_init_info info) {
          *    'return function() local t={} ... return t end')
          *  - table → materialize rows */
         if (lua_isfunction(L, -1) && lua_iscfunction(L, -1)) {
-            s->gen_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+            /* Move the wrap iterator into the shared non-TLS state so every
+             * tbt_func (any thread) resumes the same coroutine. LUA_LOCK is
+             * held (recursive); the TLS state keeps its compiled source. */
+            TBT_L_();
+            if (!g_tbt_lua) { LUA_UNLOCK(); return; }
+            lua_xmove(L, g_tbt_lua, 1);
+            s->gen_ref = luaL_ref(g_tbt_lua, LUA_REGISTRYINDEX);
             LUA_UNLOCK();
             return;
         }
@@ -1441,7 +1459,7 @@ static void tbt_func(duckdb_function_info fi, duckdb_data_chunk out) {
      * nil row_idx (or dead coroutine) ends the stream. */
     if (s->gen_ref != LUA_NOREF) {
         LUA_LOCK();
-        lua_State *L = g_lua;
+        lua_State *L = g_tbt_lua;  /* shared state — NOT the TLS state */
         if (!L) { LUA_UNLOCK(); duckdb_data_chunk_set_size(out, 0); return; }
         lua_rawgeti(L, LUA_REGISTRYINDEX, s->gen_ref);
         if (lua_pcall(L, 0, 2, 0) != LUA_OK) {
