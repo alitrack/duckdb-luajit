@@ -55,8 +55,12 @@ jobs:
       - name: Build (release)
         run: make release
         env:
-          CC: ccache clang
-          CXX: ccache clang++
+          # gcc, NOT clang: LuaJIT's string hash misbehaves under clang builds
+          # (specific-length UDF names resolve to garbage → NULL). Verified:
+          # gcc-built LuaJIT handles all lengths; clang-built fails on
+          # 13/20/24/32/40-char names. Local = gcc, CI must match.
+          CC: ccache gcc
+          CXX: ccache g++
       - name: Run SQLLogicTests
         run: make test_release SKIP_TESTS=0
 
