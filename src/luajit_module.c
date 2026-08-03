@@ -219,12 +219,20 @@ static void apply_trusted(lua_State *L, bool on) {
 /* ── DuckDB callback from Lua: _duckdb_call(sql) → status VARCHAR ── */
 
 /* forward decls (defined with the type helpers below; used by _duckdb_query) */
-/* DuckDB string_t inline/pointer dispatch, implemented locally instead of
- * calling the CLI-exported duckdb_string_t_data(): the ≥12-byte boundary
- * behaved differently on CI-built extensions (12-char UDF names resolved to
- * garbage → NULL results). Layout is stable: 16-byte union, inlined[12]. */
+/* DuckDB string_t inline/pointer dispatch. Implemented locally (not the
+ * CLI-exported duckdb_string_t_data()) with strict-aliasing-safe memcpy
+ * reads: union type-punning is UB and clang's optimizer produces different
+ * results than gcc, breaking 12-char inline strings (UDF names) on CI.
+ * Layout: length(4) | pointer{prefix(4), ptr(8)} | inlined{data(12)}. */
 static inline const char *lj_string_data(duckdb_string_t *s) {
-    return s->value.pointer.length > 12 ? s->value.pointer.ptr : s->value.inlined.inlined;
+    uint32_t len;
+    memcpy(&len, s, sizeof(len));
+    if (len > 12) {
+        const char *ptr;
+        memcpy(&ptr, (const char *)s + 8, sizeof(ptr));
+        return ptr;
+    }
+    return (const char *)s + 4;
 }
 
 static void push_timestamp_micros(lua_State *L, int64_t micros);
