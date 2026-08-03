@@ -2,6 +2,14 @@
 
 Self-contained DuckDB extension for Lua expressions, JIT-compiled UDFs, and nested type bridges via LuaJIT. ~700KB, MIT licensed.
 
+> **v0.21 changes**: STRUCT bridge — DECIMAL children (any width, 1.5 not
+> silently nil), true element-width reads for all int types (INTEGER/SMALLINT/
+> TINYINT + unsigned family; negative values no longer read as huge unsigned),
+> NULL children → `nil`, and nested STRUCT/LIST children (recursive bridge).
+> LIST bridge: per-width int reads + DECIMAL elements. Fixes: DuckDB decimal
+> physical storage is width-banded (≤4 int16 / ≤9 int32 / ≤18 int64 / else
+> int128), not always int64.
+>
 > **v0.20 changes**: `luajit_agg` BIGINT overload — integer aggregation now
 > returns BIGINT exactly (no float coercion, matches native `sum(x)`); DOUBLE
 > overload preserved. v0.19: trusted sandbox mode; `_duckdb_query` result-set bridge;
