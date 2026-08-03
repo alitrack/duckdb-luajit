@@ -1,211 +1,72 @@
-# luajit — DuckDB LuaJIT UDF Extension  v0.20
+# luajit — DuckDB LuaJIT UDF Extension  v0.27
 
 Self-contained DuckDB extension for Lua expressions, JIT-compiled UDFs, and nested type bridges via LuaJIT. ~700KB, MIT licensed.
 
-> **v0.24 changes**: luajit_table serializes execution (`set_max_threads(1)`)
-> — the C API only guarantees init_data on the init thread, so parallel
-> workers got NULL → 0 rows (seen on Windows/macOS). CI: main build matrix
-> back to `skip_tests: true` (LuaJIT behaviour differs on macOS arm64 /
-> Windows); new `sqllogictest-linux` job runs the SQLLogicTests on linux_amd64.
->
-> **v0.23 changes**: quick_compile auto-detects UDF style — scalar UDFs
-> (numeric, date-string, or STRUCT `{x,y}` probes) map to `luajit_s` /
-> `luajit_i` / `luajit_f` / `luajit_b` macros, batch UDFs map to `luajit_vs`.
-> `luajit_s` now accepts any scalar argument (was STRUCT-only), via
-> `push_any_to_lua`. Manual style override: `source := 's'` (SCALAR) in
-> macro mode.
->
-> **v0.22 changes**: quick_compile macros now EXECUTE the DDL (name callable
-> immediately) and VARCHAR-returning UDFs map to `luajit_vs` with CAST args.
-> `luajit_l` accepts any LIST child type (`LIST(ANY)`), not just BIGINT[].
-> luajit_table fixed: materialize stack management (string/nested-table/nil
-> rows), coroutine.wrap generators no longer consumed by the probe call.
-> SQLLogicTests enabled (`luajit_bridge.test`, 27 assertions).
->
-> **v0.21 changes**: STRUCT bridge — DECIMAL children (any width, 1.5 not
-> silently nil), true element-width reads for all int types (INTEGER/SMALLINT/
-> TINYINT + unsigned family; negative values no longer read as huge unsigned),
-> NULL children → `nil`, and nested STRUCT/LIST children (recursive bridge).
-> LIST bridge: per-width int reads + DECIMAL elements. Fixes: DuckDB decimal
-> physical storage is width-banded (≤4 int16 / ≤9 int32 / ≤18 int64 / else
-> int128), not always int64.
->
-> **v0.20 changes**: `luajit_agg` BIGINT overload — integer aggregation now
-> returns BIGINT exactly (no float coercion, matches native `sum(x)`); DOUBLE
-> overload preserved. v0.19: trusted sandbox mode; `_duckdb_query` result-set bridge;
-> DATE/TIMESTAMP/DECIMAL/HUGEINT bridging; streaming `luajit_table` generator
-> mode; chunk-batched BIGINT/VARCHAR UDFs (`luajit_vi`/`luajit_vs`); LIST bridge
-> NULL elements + BOOLEAN children; MSVC build fix.
->
-> **v0.18 changes**: GC64 enabled (2GB memory wall removed); UDF resolution
-> moved from per-row to per-chunk (registry refs — ~6× faster row-mode UDFs);
-> runtime Lua errors queryable via `luajit_module(mode:='last_error')`; crash
-> fix for LIST outputs when the UDF name is undefined.
+> **v0.27 changes**: `luajit_table` generator mode fixed — the coroutine.wrap
+> iterator was registered in the init thread's TLS lua_State but resumed from
+> other threads' TLS states (cross-state registry lookup → nil → intermittent
+> 0 rows). Fix: generator uses a shared non-TLS state (`lua_xmove` the
+> iterator there); all workers resume the same coroutine under the global
+> lock. Verified 100/100 independent runs + full SQLLogicTests. Built/tested
+> against DuckDB v1.5.5.
 
-## Quick Start
+## 快速开始
 
 ```sql
-LOAD luajit;
-
--- Compile + auto-type + auto-macro in one shot
-SELECT message FROM luajit_module(
-    mode := 'quick_compile',
-    source := 'return function(a, b) return a + b end',
-    sql_name := 'add'
-);
-SELECT add(3, 4);  -- 7  (auto-macro → luajit_i)
+LOAD 'luajit';
+-- JIT 编译的 Lua 表达式/标量 UDF
+SELECT luajit_i('return x * 2', 21) AS r;          -- 42
+SELECT luajit_s('return "hello " .. x', 'world');  -- hello world
+-- 表函数：Lua 源码 → 多行
+SELECT * FROM luajit_table('return {"a", "b", "c"}');
 ```
 
-## Functions
+## Lua 库模式（libs）——一条 SQL 加载函数/表函数
 
-### Scalar UDFs (8)
-
-| Function | Type | Example |
-|----------|------|---------|
-| `luajit(name)` | VARCHAR → VARCHAR | `SELECT luajit('return 1+1')` → `'2'` |
-| `luajit_i(name, a..)` | BIGINT → BIGINT | `SELECT luajit_i('add', 3, 4)` → 7 |
-| `luajit_f(name, a..)` | DOUBLE → DOUBLE | `SELECT luajit_f('sqrt', 9.0)` → 3.0 |
-| `luajit_b(name, a..)` | BOOLEAN → BOOLEAN | `SELECT luajit_b('all', true, false)` → false |
-| `luajit_m(name, a..)` | ANY → DOUBLE | `SELECT luajit_m('sum', 1, 2.5, 3)` → 6.5 |
-| `luajit_v(name, a..)` | DOUBLE 列批量 | `SELECT luajit_v('dblv', x)` — 1 Lua 调用/chunk，UDF 收整列 table 返 table |
-| `luajit_vi(name, a..)` | BIGINT 列批量 | `SELECT luajit_vi('dblv', x)` — int64 版批量 |
-| `luajit_vs(name, a..)` | VARCHAR 列批量 | `SELECT luajit_vs('upv', name)` — string 版批量 |
-| `luajit_l(name, a..)` | LIST → LIST(DOUBLE) | `SELECT luajit_l('top2', [3,1,4,2])` → `[4.0,3.0]` |
-| `luajit_s(name, s)` | STRUCT → VARCHAR | `SELECT luajit_s('fmt', {x:3, y:4})` → `'x=3 y=4'` |
-| `luajit_map(name, m)` | MAP → VARCHAR | `SELECT luajit_map('fmt', map{'a':1})` → `'a=1'` |
-
-### Aggregate UDF
+社区扩展覆盖主流格式（parquet/csv/iceberg）；**长尾格式**（DICOM/EXIF/PDF/私有 API）
+用 Lua 库补——从 [duckdb-luajit-libs](https://github.com/alitrack/duckdb-luajit-libs)
+一条 SQL 拉取即用，无需编译、无需 INSTALL：
 
 ```sql
--- Compile a UDF that receives ALL accumulated values as Lua table {v1, v2, ...}
-SELECT ok FROM luajit_module(
-    mode := 'compile',
-    source := 'return function(v) local s=0;for i=1,#v do s=s+v[i] end;return s end',
-    sql_name := 'mysum'
-);
-
--- Single group
-SELECT luajit_agg('mysum', x) FROM (VALUES (1),(2),(3)) t(x);  -- 6.0
-
--- GROUP BY support (up to 256 groups)
-SELECT g, luajit_agg('mysum', v) FROM data GROUP BY g;
-
--- median, avg, stddev, percentile — any aggregate you can write in Lua
-SELECT luajit_agg('mymedian', price) FROM trades;
+LOAD 'luajit';
+SET VARIABLE src = (SELECT content FROM read_text(
+  'https://raw.githubusercontent.com/alitrack/duckdb-luajit-libs/main/libs/datasource/dicom.lua'));
+-- 表函数：扫目录解析 DICOM（1000 文件 ~40ms）
+SELECT count(*) FROM luajit_table(getvariable('src'));
 ```
 
-### Table Function
+libs 仓库分类：`datasource`（读文件/目录）/ `parser`（JSON 等）/ `udf` / `network` / `ffi`，
+每库头部带元数据（`@category/@desc/@requires`），有 ROADMAP（Phase 0-4）与贡献规范。
 
-```sql
--- Compiled UDF
-SELECT * FROM luajit_table('gen_data');
--- (1, 'a'), (2, 'b'), (3, 'c')
+## 函数总览
 
--- Inline: function that returns a table (materialized at init)
-SELECT * FROM luajit_table(
-    'return function() local t={};for i=1,100 do t[i]=i*i end;return t end'
-);
+| 函数 | 用途 |
+|---|---|
+| `luajit_i/f/s/b` | 标量 UDF（int/float/varchar/blob 参数） |
+| `luajit_l` | LIST 输入（任意子类型） |
+| `luajit_vs/vi` | 批量（chunk-batched）VARCHAR/BIGINT UDF |
+| `luajit_agg` | 聚合 UDF（BIGINT/DOUBLE） |
+| `luajit_table` | 表函数（table 行 / coroutine.wrap generator 流式） |
+| `luajit_module` | quick_compile（注册 UDF）、last_error 等控制面 |
 
--- Streaming: function returns a coroutine.wrap generator — O(1) memory,
--- rows are pulled one chunk at a time (yield row_idx, val; nil ends)
-SELECT count(*) FROM luajit_table('return function()
-    return coroutine.wrap(function()
-        for i = 1, 1000000 do coroutine.yield(i, "row-" .. i) end
-    end)
-end');
-```
+## 安全
 
-## Module API (10 modes)
+trusted 沙箱模式移除 `io/os/ffi/package/require/load*`（不可触文件系统/网络/系统调用）；
+普通模式保留全部 Lua 能力（文件、FFI、`_duckdb_query` 回查）。默认非 trusted。
 
-| Mode | Params | Description |
-|------|--------|-------------|
-| `info` | — | Extension version |
-| `compile` | source, sql_name | Compile + store |
-| `quick_compile` | source, sql_name | Compile + auto-type + auto-macro |
-| `inspect` | sql_name | Arity, return type, source |
-| `macro` | sql_name, source? | Generate CREATE MACRO DDL |
-| `list` | — | List compiled UDFs |
-| `drop` | sql_name | Remove one UDF |
-| `reset` | — | Clear all UDFs |
-| **`fennel`** | source + sql_name | Compile Fennel source → Lua UDF via the **embedded fennel compiler** (match patterns, macros — zero runtime cost) |
-| **`trusted`** | `'on'`/`'off'` | Sandbox toggle: removes io/ffi/package/require/load*/debug, reduces os to date/clock/time/difftime |
-| **`last_error`** | — | Most recent Lua UDF runtime error |
-| **`save`** | source? (path) | Persist to file |
-| **`load`** | source? (path) | Restore from file |
+## 版本历史
 
-Result: `(ok BOOLEAN, mode, phase, message, detail, sql_name VARCHAR)`
+- **v0.27**: generator 共享非 TLS state 修复（跨线程 registry 错位）；v1.5.5 对齐
+- **v0.24**: `luajit_table` 串行执行（`set_max_threads(1)`）；CI 构建矩阵 `skip_tests: true`（macOS arm64/Windows 行为差异），新增 `sqllogictest-linux` job
+- **v0.23**: quick_compile 自动识别 UDF 风格（标量→`luajit_s/i/f/b`、批量→`luajit_vs`）；`luajit_s` 接受任意标量参数
+- **v0.22**: quick_compile 宏直接执行 DDL；VARCHAR 返回 UDF 映射 `luajit_vs`；`luajit_l` 接受 `LIST(ANY)`；luajit_table materialize 修复；SQLLogicTests 启用
+- **v0.21**: STRUCT 桥（DECIMAL 任意宽度/真元素宽度读/NULL 子项/嵌套递归）；LIST 桥按宽度读 + DECIMAL 元素；DuckDB decimal 物理存储按宽度分带（≤4 int16 / ≤9 int32 / ≤18 int64 / 否则 int128）
+- **v0.20**: `luajit_agg` BIGINT 精确返回；trusted 沙箱；`_duckdb_query` 结果桥；DATE/TIMESTAMP/DECIMAL/HUGEINT 桥；流式 generator；chunk 批量 UDF；LIST 桥 NULL/BOOLEAN；MSVC 修复
+- **v0.19**: GC64（2GB 内存墙移除）；UDF 解析修复
+- **v0.18 及更早**: 类型桥演化（见 git log）
 
-### Error handling
+## 相关资源
 
-A Lua runtime error in a UDF (e.g. `return x + nil`) marks the affected rows
-NULL **and** records the real error message — retrieve it after the query:
-
-```sql
-SELECT message FROM luajit_module(mode:='last_error');
--- luajit UDF error: [string "..."]:1: attempt to perform arithmetic on a nil value
-```
-
-### Persistence
-
-```sql
--- Save all compiled UDFs
-SELECT message FROM luajit_module(mode := 'save', source := 'my_udfs.txt');
--- saved 5 UDFs to my_udfs.txt
-
--- Restore after restart
-SELECT message FROM luajit_module(mode := 'load', source := 'my_udfs.txt');
--- loaded 5 UDFs from my_udfs.txt
-```
-
-## Nested Type Bridges
-
-- **LIST**: `luajit_l` — DuckDB LIST ↔ Lua table (1-indexed array)
-- **STRUCT**: `luajit_s` — DuckDB STRUCT ↔ Lua table (named keys)
-- **MAP**: `luajit_map` — DuckDB MAP ↔ Lua table (key-value pairs)
-
-## Lua → DuckDB Callback
-
-```sql
--- Execute SQL, returns 'ok' or 'error: <msg>'
-SELECT luajit('return _duckdb_call("CREATE TABLE log(ts TIMESTAMP DEFAULT NOW())")');
-
--- Execute query → result table: { {col=val, ...}, ... } (nil on error)
-SELECT luajit('
-    local rows = _duckdb_query("select id, name from t order by id limit 2")
-    return rows[1].id .. "," .. rows[1].name
-');
--- Types: integers/doubles → Lua numbers, BOOLEAN → boolean, NULL → nil
--- Errors: returns nil + error message instead of raising (check r == nil)
-```
-
-## Design
-
-- **LuaJIT 2.1** (MIT, **GC64 build**): ~700KB, self-contained, trace-based JIT
-- **14 functions**: 10 scalar (3 chunk-batched), 1 aggregate (GROUP BY), 1 table, 1 module
-- **14 modes**: info, trusted, last_error, compile, quick_compile, **fennel**, inspect, macro, list, drop, reset, save, load
-- **Per-group state**: aggregate uses state-pointer-keyed array (256 max groups)
-- **Per-thread Lua states (P4)**: each worker thread owns its lua_State via TLS —
-  no global lock on Lua execution, DuckDB thread parallelism maps to LuaJIT
-  parallelism (~2.4× on 4 threads, CPU-bound UDFs). UDF sources live in a
-  shared table; states compile lazily on first use (executor + aggregate
-  finalize). trusted sandbox applies lazily per state (on and off).
-- **Per-type executors**: specialized callbacks for each DuckDB type, UDF resolved once per chunk (registry ref)
-- **Nested types**: LIST/STRUCT/MAP bridge via DUCKDB_TYPE_ANY
-- **Benchmark** (1M rows, 2 BIGINT args, `a*b+a`): row-mode 0.034s (1t) → 0.013s (4t); batch-mode (`luajit_vi`) 0.018s (1t) → 0.013s (4t) = **2.6× vs row+serial**
-- **FFI zero-copy (P5) — deliberately not implemented**: passing column data as cdata arrays would break UDF compatibility (`#t`, table ops) and cdata arithmetic is only partially JIT-traceable; batch tables are pre-allocated (`lua_createtable(n)`) so the push path is already amortized
-
-## Documentation
-
-- [Lua 能力清单](docs/lua-capabilities.md) — 在 SQL 里写 Lua 能干什么（FFI/GC64/避雷）
-- [语法层指南](docs/syntax-layers.md) — Fennel/Teal/MoonScript 编译到 Lua，零引擎成本换语法
-
-## Build
-
-```sh
-git clone https://github.com/alitrack/luajit.git && cd luajit
-./bootstrap.sh && make release  # → build/release/luajit.duckdb_extension
-```
-
-## License
-
-MIT
+- [duckdb-luajit-libs](https://github.com/alitrack/duckdb-luajit-libs) — Lua 库仓库（分类 + 安装协议 + ROADMAP）
+- 系列文章：类型补全 / 签名 API 数据源 / DICOM（83 行）/ 目录扫描（110 行）——公众号「测试号」
+- 社区扩展 PR: duckdb/community-extensions#2428（CI 全绿，待合并）
