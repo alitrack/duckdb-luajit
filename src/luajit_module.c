@@ -466,6 +466,15 @@ static int resolve_udf_chunk(lua_State *L, duckdb_vector nv) {
     duckdb_string_t ns=((duckdb_string_t*)duckdb_vector_get_data(nv))[0];
     if(!duckdb_validity_row_is_valid(duckdb_vector_get_validity(nv),0)) return LUA_NOREF;
     const char *name = lj_string_data(&ns);
+    /* DuckDB string_t data is NOT NUL-terminated (length field rules), and
+     * the heap is a contiguous buffer — strlen() can run past the value into
+     * an adjacent string's bytes (seen as 0x08). Copy the exact length. */
+    size_t nlen = duckdb_string_t_length(ns);
+    char nbuf[512];
+    if (nlen >= sizeof(nbuf)) return LUA_NOREF;
+    memcpy(nbuf, name, nlen);
+    nbuf[nlen] = 0;
+    name = nbuf;
     lua_getglobal(L,name);
     if(lua_isfunction(L,-1)) return luaL_ref(L,LUA_REGISTRYINDEX);
     lua_pop(L,1);
