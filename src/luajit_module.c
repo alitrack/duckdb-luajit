@@ -1352,6 +1352,10 @@ static void tbt_init(duckdb_init_info info) {
     memset(s, 0, sizeof(*s));
     s->gen_ref = LUA_NOREF;
     duckdb_init_set_init_data(info, s, tbt_state_free);
+    /* Serial execution: init_data is shared across function calls, and the C
+     * API only guarantees it on the init thread. Without this, parallel
+     * workers get NULL init_data → 0 rows (seen on Windows/macOS). */
+    duckdb_init_set_max_threads(info, 1);
 
     if (d && d->source) {
         L_(); lua_State *L = g_lua;

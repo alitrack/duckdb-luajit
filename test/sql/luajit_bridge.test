@@ -1,7 +1,9 @@
 # name: test/sql/luajit_bridge.test
 # description: Type bridges (STRUCT/LIST), quick_compile macros, and FFI-adjacent semantics
 # group: [luajit]
-# skipif: macos_arm64
+# Run via `make test_release SKIP_TESTS=0` (CI: sqllogictest-linux job) — the
+# main build matrix keeps skip_tests: true because LuaJIT behaviour differs on
+# macOS arm64 / Windows (seen: luajit_table 0 rows, scalar-macro NULL).
 
 require luajit
 

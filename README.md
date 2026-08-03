@@ -2,6 +2,12 @@
 
 Self-contained DuckDB extension for Lua expressions, JIT-compiled UDFs, and nested type bridges via LuaJIT. ~700KB, MIT licensed.
 
+> **v0.24 changes**: luajit_table serializes execution (`set_max_threads(1)`)
+> — the C API only guarantees init_data on the init thread, so parallel
+> workers got NULL → 0 rows (seen on Windows/macOS). CI: main build matrix
+> back to `skip_tests: true` (LuaJIT behaviour differs on macOS arm64 /
+> Windows); new `sqllogictest-linux` job runs the SQLLogicTests on linux_amd64.
+>
 > **v0.23 changes**: quick_compile auto-detects UDF style — scalar UDFs
 > (numeric, date-string, or STRUCT `{x,y}` probes) map to `luajit_s` /
 > `luajit_i` / `luajit_f` / `luajit_b` macros, batch UDFs map to `luajit_vs`.

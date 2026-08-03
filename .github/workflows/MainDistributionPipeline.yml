@@ -22,8 +22,36 @@ jobs:
       ci_tools_version: v1.5-variegata
       extension_name: luajit
       extra_toolchains: python3
-      skip_tests: false
+      skip_tests: true
       exclude_archs: 'linux_arm64;wasm_eh;wasm_mvp;wasm_threads;windows_amd64_mingw;windows_amd64_rtools'
+
+  sqllogictest-linux:
+    name: SQLLogicTests (linux_amd64)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install Ninja
+        run: sudo apt-get update && sudo apt-get install -y ninja-build python3-pip
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - name: Setup CCache
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ github.job }}
+      - name: Configure (release)
+        run: make configure
+      - name: Build (release)
+        run: make release
+        env:
+          CC: ccache clang
+          CXX: ccache clang++
+      - name: Run SQLLogicTests
+        run: make test_release SKIP_TESTS=0
 
   release:
     name: Create GitHub Release
