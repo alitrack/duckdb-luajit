@@ -1353,11 +1353,12 @@ static void agg_finalize(duckdb_function_info fi, duckdb_aggregate_state *src, d
 
 /* ── luajit_table: Lua table function ── */
 
-typedef struct { char *source; } tbt_data_t;
+typedef struct { char *source; char *list; char *mode; } tbt_data_t;
 /* table mode: rows[] materialized at init; generator mode: gen_ref is a
  * coroutine.wrap iterator resumed per chunk (streaming, O(1) memory). */
 typedef struct {
     int cur_row; char **rows; int nrows;
+    idx_t *rowlens;  /* non-NULL in blob mode (rows may contain NUL bytes) */
     int gen_ref;   /* coroutine.wrap iterator in the shared g_tbt_lua state */
 } tbt_state_t;
 
@@ -1370,6 +1371,7 @@ static void tbt_state_free(void *p) {
             LUA_UNLOCK();
         }
         if (s->rows) duckdb_free(s->rows);
+        if (s->rowlens) duckdb_free(s->rowlens);
         duckdb_free(s);
     }
 }
@@ -1379,8 +1381,13 @@ static void tbt_bind(duckdb_bind_info info) {
     memset(d, 0, sizeof(*d));
     duckdb_value v = duckdb_bind_get_parameter(info, 0);
     if (v) { d->source = strdup(duckdb_get_varchar(v)); duckdb_destroy_value(&v); }
+    duckdb_value vl = duckdb_bind_get_named_parameter(info, "list");   /* optional */
+    if (vl) { d->list = strdup(duckdb_get_varchar(vl)); duckdb_destroy_value(&vl); }
+    duckdb_value vm = duckdb_bind_get_named_parameter(info, "mode");   /* optional: 'blob' */
+    if (vm) { d->mode = strdup(duckdb_get_varchar(vm)); duckdb_destroy_value(&vm); }
     duckdb_bind_add_result_column(info, "row_idx", duckdb_create_logical_type(DUCKDB_TYPE_BIGINT));
-    duckdb_bind_add_result_column(info, "val", duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+    duckdb_bind_add_result_column(info, "val", duckdb_create_logical_type(
+        d->mode && !strcmp(d->mode, "blob") ? DUCKDB_TYPE_BLOB : DUCKDB_TYPE_VARCHAR));
     duckdb_bind_set_bind_data(info, d, free);
 }
 
@@ -1426,13 +1433,18 @@ static void tbt_init(duckdb_init_info info) {
             return;
         }
         if (lua_isfunction(L, -1)) {
-            if (lua_pcall(L, 0, 1, 0) != LUA_OK) { lua_pop(L, 1); LUA_UNLOCK(); return; }
+            /* optional list arg → function(list) (dirscan/dicom pattern) */
+            if (d->list) { lua_pushlstring(L, d->list, strlen(d->list)); }
+            if (lua_pcall(L, d->list ? 1 : 0, 1, 0) != LUA_OK) { lua_pop(L, 1); LUA_UNLOCK(); return; }
         }
         if (!lua_istable(L, -1)) { lua_pop(L, 1); LUA_UNLOCK(); return; }
 
         int n = (int)lua_objlen(L, -1);
         s->nrows = n;
         s->rows = (char **)duckdb_malloc(n * sizeof(char *));
+        if (d->mode && !strcmp(d->mode, "blob")) {
+            s->rowlens = (idx_t *)duckdb_malloc(n * sizeof(idx_t));
+        }
         for (int i = 0; i < n; i++) {
             lua_rawgeti(L, -1, i + 1);           /* stack: [result, elem] */
             if (lua_isnil(L, -1)) {
@@ -1445,7 +1457,16 @@ static void tbt_init(duckdb_init_info info) {
                 lua_remove(L, -2);               /* replace elem → [result, str] */
             }
             /* string elem: to_str is a no-op, stack is already [result, elem] */
-            s->rows[i] = strdup(lua_tostring(L, -1));
+            if (d->mode && !strcmp(d->mode, "blob")) {
+                size_t rl = 0;
+                const char *rs = lua_tolstring(L, -1, &rl);   /* NUL-safe for BLOB rows */
+                s->rows[i] = (char *)duckdb_malloc(rl + 1);
+                memcpy(s->rows[i], rs, rl);
+                s->rows[i][rl] = 0;
+                if (s->rowlens) s->rowlens[i] = (idx_t)rl;
+            } else {
+                s->rows[i] = strdup(lua_tostring(L, -1));
+            }
             lua_pop(L, 1);                       /* [result] */
         }
         lua_pop(L, 1); /* pop result table */
@@ -1489,8 +1510,9 @@ static void tbt_func(duckdb_function_info fi, duckdb_data_chunk out) {
         }
         duckdb_data_chunk_set_size(out, 1);
         ((int64_t *)duckdb_vector_get_data(duckdb_data_chunk_get_vector(out, 0)))[0] = (int64_t)lua_tointeger(L, -2);
-        const char *v = lua_tostring(L, -1);
-        duckdb_vector_assign_string_element(duckdb_data_chunk_get_vector(out, 1), 0, v ? v : "");
+        size_t glen = 0;
+        const char *gv = lua_tolstring(L, -1, &glen);   /* NUL-safe (blob mode) */
+        duckdb_vector_assign_string_element_len(duckdb_data_chunk_get_vector(out, 1), 0, gv ? gv : "", glen);
         lua_pop(L, 2);
         LUA_UNLOCK();
         return;
@@ -1500,8 +1522,13 @@ static void tbt_func(duckdb_function_info fi, duckdb_data_chunk out) {
     if (s->cur_row >= s->nrows) { duckdb_data_chunk_set_size(out, 0); return; }
     duckdb_data_chunk_set_size(out, 1);
     ((int64_t *)duckdb_vector_get_data(duckdb_data_chunk_get_vector(out, 0)))[0] = s->cur_row + 1;
-    duckdb_vector_assign_string_element(duckdb_data_chunk_get_vector(out, 1), 0,
-        s->rows ? s->rows[s->cur_row] : "NIL");
+    if (s->rowlens) {  /* blob mode: length-aware, NUL-safe */
+        duckdb_vector_assign_string_element_len(duckdb_data_chunk_get_vector(out, 1), 0,
+            s->rows ? s->rows[s->cur_row] : "", s->rowlens[s->cur_row]);
+    } else {
+        duckdb_vector_assign_string_element(duckdb_data_chunk_get_vector(out, 1), 0,
+            s->rows ? s->rows[s->cur_row] : "NIL");
+    }
     s->cur_row++;
 }
 
@@ -2062,6 +2089,8 @@ void luajit_register_module_functions(
     { duckdb_table_function t = duckdb_create_table_function();
       duckdb_table_function_set_name(t, "luajit_table");
       duckdb_table_function_add_parameter(t, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_table_function_add_named_parameter(t, "list", duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_table_function_add_named_parameter(t, "mode", duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
       duckdb_table_function_set_bind(t, tbt_bind);
       duckdb_table_function_set_init(t, tbt_init);
       duckdb_table_function_set_function(t, tbt_func);
