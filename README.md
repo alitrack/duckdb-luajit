@@ -42,7 +42,7 @@ libs 仓库分类：`datasource`（读文件/目录）/ `parser`（JSON 等）/ 
 
 | 函数 | 用途 |
 |---|---|
-| `luajit_i/f/s/b` | 标量 UDF（int/float/varchar/blob 参数） |
+| `luajit_i/f/s/b` | 标量 UDF（int/float/varchar/boolean 参数） |
 | `luajit_l` | LIST 输入（任意子类型） |
 | `luajit_vs/vi` | 批量（chunk-batched）VARCHAR/BIGINT UDF |
 | `luajit_agg` | 聚合 UDF（BIGINT/DOUBLE） |

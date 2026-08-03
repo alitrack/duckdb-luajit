@@ -995,7 +995,7 @@ static void push_scalar_to_lua(lua_State *L, duckdb_vector v, idx_t r) {
     duckdb_type ct = duckdb_get_type_id(lt);
     void *data = duckdb_vector_get_data(v);
     if (!duckdb_validity_row_is_valid(duckdb_vector_get_validity(v), r)) { lua_pushnil(L); return; }
-    if (ct == DUCKDB_TYPE_VARCHAR) {
+    if (ct == DUCKDB_TYPE_VARCHAR || ct == DUCKDB_TYPE_BLOB) {
         duckdb_string_t s = ((duckdb_string_t *)data)[r];
         lua_pushlstring(L, lj_string_data(&s), duckdb_string_t_length(s));
     } else if (ct == DUCKDB_TYPE_TINYINT) lua_pushinteger(L, ((int8_t *)data)[r]);
@@ -1070,7 +1070,9 @@ static void fjs(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
         push_any_to_lua(L, duckdb_data_chunk_get_vector(in, 1), r);
         if (!call_udf(fi,L,1,1)){invalidate_from(out,r,nr);break;}
         to_str(L);
-        duckdb_vector_assign_string_element(out, r, lua_tostring(L, -1));
+        size_t slen = 0;
+        const char *sval = lua_tolstring(L, -1, &slen);   /* length-aware: BLOB with NUL bytes */
+        duckdb_vector_assign_string_element_len(out, r, sval, slen);
         lua_pop(L, 1);
     }
     luaL_unref(L,LUA_REGISTRYINDEX,udf_ref);
@@ -2005,6 +2007,18 @@ void luajit_register_module_functions(
       duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
       duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_ANY));
       duckdb_scalar_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_register_scalar_function(conn, f);
+      duckdb_destroy_scalar_function(&f); }
+
+    /* luajit_blob: Lua string → BLOB return bridge (BLOB param via ANY is
+     * read as string_t by push_scalar_to_lua; BLOB column storage is also
+     * string_t, so fjs writes it — length-aware, NUL-safe). */
+    { duckdb_scalar_function f = duckdb_create_scalar_function();
+      duckdb_scalar_function_set_name(f, "luajit_blob");
+      duckdb_scalar_function_set_function(f, fjs);
+      duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_scalar_function_add_parameter(f, duckdb_create_logical_type(DUCKDB_TYPE_ANY));
+      duckdb_scalar_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_BLOB));
       duckdb_register_scalar_function(conn, f);
       duckdb_destroy_scalar_function(&f); }
 
