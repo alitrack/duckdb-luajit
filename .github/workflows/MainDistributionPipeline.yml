@@ -39,6 +39,13 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 1
+      - name: Checkout Extension CI tools
+        uses: actions/checkout@v4
+        with:
+          repository: duckdb/extension-ci-tools
+          path: extension-ci-tools
+          ref: v1.5-variegata
+          fetch-depth: 1
       - name: Setup CCache
         uses: hendrikmuhs/ccache-action@v1.2
         with:
