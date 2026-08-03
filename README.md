@@ -2,6 +2,13 @@
 
 Self-contained DuckDB extension for Lua expressions, JIT-compiled UDFs, and nested type bridges via LuaJIT. ~700KB, MIT licensed.
 
+> **v0.23 changes**: quick_compile auto-detects UDF style — scalar UDFs
+> (numeric, date-string, or STRUCT `{x,y}` probes) map to `luajit_s` /
+> `luajit_i` / `luajit_f` / `luajit_b` macros, batch UDFs map to `luajit_vs`.
+> `luajit_s` now accepts any scalar argument (was STRUCT-only), via
+> `push_any_to_lua`. Manual style override: `source := 's'` (SCALAR) in
+> macro mode.
+>
 > **v0.22 changes**: quick_compile macros now EXECUTE the DDL (name callable
 > immediately) and VARCHAR-returning UDFs map to `luajit_vs` with CAST args.
 > `luajit_l` accepts any LIST child type (`LIST(ANY)`), not just BIGINT[].

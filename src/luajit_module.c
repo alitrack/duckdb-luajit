@@ -951,6 +951,44 @@ static void push_struct_to_lua(lua_State *L, duckdb_vector sv, idx_t r) {
     }
 }
 
+/* Scalar DuckDB value → Lua value (element-width aware, validity-checked).
+ * Used by push_any_to_lua for non-nested luajit_s arguments. */
+static void push_scalar_to_lua(lua_State *L, duckdb_vector v, idx_t r) {
+    duckdb_logical_type lt = duckdb_vector_get_column_type(v);
+    duckdb_type ct = duckdb_get_type_id(lt);
+    void *data = duckdb_vector_get_data(v);
+    if (!duckdb_validity_row_is_valid(duckdb_vector_get_validity(v), r)) { lua_pushnil(L); return; }
+    if (ct == DUCKDB_TYPE_VARCHAR) {
+        duckdb_string_t s = ((duckdb_string_t *)data)[r];
+        lua_pushlstring(L, duckdb_string_t_data(&s), duckdb_string_t_length(s));
+    } else if (ct == DUCKDB_TYPE_TINYINT) lua_pushinteger(L, ((int8_t *)data)[r]);
+    else if (ct == DUCKDB_TYPE_SMALLINT) lua_pushinteger(L, ((int16_t *)data)[r]);
+    else if (ct == DUCKDB_TYPE_INTEGER) lua_pushinteger(L, ((int32_t *)data)[r]);
+    else if (ct == DUCKDB_TYPE_BIGINT) lua_pushinteger(L, ((int64_t *)data)[r]);
+    else if (ct == DUCKDB_TYPE_UTINYINT) lua_pushinteger(L, ((uint8_t *)data)[r]);
+    else if (ct == DUCKDB_TYPE_USMALLINT) lua_pushinteger(L, ((uint16_t *)data)[r]);
+    else if (ct == DUCKDB_TYPE_UINTEGER) lua_pushinteger(L, ((uint32_t *)data)[r]);
+    else if (ct == DUCKDB_TYPE_UBIGINT) lua_pushnumber(L, (lua_Number)((uint64_t *)data)[r]);
+    else if (ct == DUCKDB_TYPE_DOUBLE) lua_pushnumber(L, ((double *)data)[r]);
+    else if (ct == DUCKDB_TYPE_FLOAT) lua_pushnumber(L, (double)((float *)data)[r]);
+    else if (ct == DUCKDB_TYPE_BOOLEAN) lua_pushboolean(L, ((bool *)data)[r]);
+    else if (ct == DUCKDB_TYPE_DECIMAL) push_decimal_any(L, lt, data, r);
+    else if (ct == DUCKDB_TYPE_DATE) push_date(L, v, r);
+    else if (ct == DUCKDB_TYPE_TIMESTAMP || ct == DUCKDB_TYPE_TIMESTAMP_S ||
+             ct == DUCKDB_TYPE_TIMESTAMP_MS || ct == DUCKDB_TYPE_TIMESTAMP_NS)
+        push_timestamp(L, v, r);
+    else if (ct == DUCKDB_TYPE_HUGEINT || ct == DUCKDB_TYPE_UHUGEINT) push_hugeint(L, v, r);
+    else lua_pushnil(L);
+}
+
+/* ANY-typed argument → Lua value: STRUCT → table, LIST → table, else scalar. */
+static void push_any_to_lua(lua_State *L, duckdb_vector v, idx_t r) {
+    duckdb_type ct = duckdb_get_type_id(duckdb_vector_get_column_type(v));
+    if (ct == DUCKDB_TYPE_STRUCT) push_struct_to_lua(L, v, r);
+    else if (ct == DUCKDB_TYPE_LIST) push_list_to_lua(L, v, duckdb_list_vector_get_child(v), r);
+    else push_scalar_to_lua(L, v, r);
+}
+
 static void write_lua_to_struct(lua_State *L, duckdb_vector out, idx_t row) {
     duckdb_logical_type st = duckdb_vector_get_column_type(out);
     idx_t nc = duckdb_struct_type_child_count(st);
@@ -992,7 +1030,7 @@ static void fjs(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     if(udf_ref==LUA_NOREF){invalidate_all(out,nr);goto lua_cleanup;}
     for (idx_t r = 0; r < nr; r++) {
         lua_rawgeti(L,LUA_REGISTRYINDEX,udf_ref);
-        push_struct_to_lua(L, duckdb_data_chunk_get_vector(in, 1), r);
+        push_any_to_lua(L, duckdb_data_chunk_get_vector(in, 1), r);
         if (!call_udf(fi,L,1,1)){invalidate_from(out,r,nr);break;}
         to_str(L);
         duckdb_vector_assign_string_element(out, r, lua_tostring(L, -1));
@@ -1594,8 +1632,9 @@ static void mod_init_locked(duckdb_init_info info) {
             else if(!strcmp(d->source,"f")||!strcmp(d->source,"DOUBLE"))var="f";
             else if(!strcmp(d->source,"b")||!strcmp(d->source,"BOOLEAN"))var="b";
             else if(!strcmp(d->source,"m")||!strcmp(d->source,"MIXED"))var="m";
+            else if(!strcmp(d->source,"s")||!strcmp(d->source,"SCALAR"))var="s";
         }
-        const char *fn=*var=='i'?"luajit_i":*var=='f'?"luajit_f":*var=='b'?"luajit_b":*var=='m'?"luajit_m":"luajit_vs";
+        const char *fn=*var=='i'?"luajit_i":*var=='f'?"luajit_f":*var=='b'?"luajit_b":*var=='m'?"luajit_m":*var=='s'?"luajit_s":"luajit_vs";
         int vstr=(*var=='v');
         char buf[4096];int off=snprintf(buf,sizeof(buf),"CREATE OR REPLACE MACRO %s(",d->sql_name);
         int nargs=2;
@@ -1639,18 +1678,54 @@ static void mod_init_locked(duckdb_init_info info) {
         if(lua_pcall(L,2,1,0)==LUA_OK&&lua_istable(L,-1))
             {lua_getfield(L,-1,"nparams");np=(int)lua_tointeger(L,-1);lua_pop(L,1);}
         lua_pop(L,2);lua_pop(L,1);
-        /* Step 3: probe return type by calling with zero ints */
-        const char *var="v"; /* v=f(0,...) → VARCHAR */
+        /* Step 3: probe return type AND calling style.
+         * Probe A — scalar with integer 0 (numeric scalar UDFs)
+         * Probe B — scalar with "0-0-0" (date/string-pattern scalar UDFs)
+         * Probe C — batch with {0,0} per param (luajit_vs-style table UDFs) */
+        const char *var="v"; const char *style="batch";
         lua_pushvalue(L,-1);
         for(int i=0;i<np;i++)lua_pushinteger(L,0);
         if(lua_pcall(L,np,1,0)==LUA_OK){
-            if(lua_isboolean(L,-1))var="b";
+            if(lua_isboolean(L,-1)){var="b";style="scalar";}
             else if(lua_isnumber(L,-1)){
                 lua_Number n=lua_tonumber(L,-1);
-                var=(n==(lua_Number)(lua_Integer)n)?"i":"f";
+                var=(n==(lua_Number)(lua_Integer)n)?"i":"f";style="scalar";
             }
+            else if(!lua_istable(L,-1)&&!lua_isnil(L,-1))style="scalar";
             lua_pop(L,1);
         }else{lua_pop(L,1);}
+        if(strcmp(style,"scalar")){
+            lua_pushvalue(L,-1);
+            for(int i=0;i<np;i++)lua_pushstring(L,"0-0-0");
+            if(lua_pcall(L,np,1,0)==LUA_OK){
+                if(!lua_istable(L,-1)&&!lua_isnil(L,-1))style="scalar";
+                lua_pop(L,1);
+            }else{lua_pop(L,1);}
+        }
+        if(strcmp(style,"scalar")){
+            lua_pushvalue(L,-1);
+            for(int i=0;i<np;i++){
+                lua_createtable(L,0,2);
+                lua_pushinteger(L,0);lua_setfield(L,-2,"x");
+                lua_pushinteger(L,0);lua_setfield(L,-2,"y");
+            }
+            if(lua_pcall(L,np,1,0)==LUA_OK){
+                if(!lua_istable(L,-1)&&!lua_isnil(L,-1))style="scalar";
+                lua_pop(L,1);
+            }else{lua_pop(L,1);}
+        }
+        if(strcmp(style,"scalar")){
+            lua_pushvalue(L,-1);
+            for(int i=0;i<np;i++){
+                lua_createtable(L,2,0);
+                lua_pushinteger(L,0);lua_rawseti(L,-2,1);
+                lua_pushinteger(L,0);lua_rawseti(L,-2,2);
+            }
+            if(lua_pcall(L,np,1,0)==LUA_OK){
+                if(lua_istable(L,-1))style="batch";
+                lua_pop(L,1);
+            }else{lua_pop(L,1);}
+        }
         /* Step 4: store as Lua global */
         /* Step 6: save source for persistence */
         lua_getglobal(L,"_UDF_SOURCES");
@@ -1662,12 +1737,14 @@ static void mod_init_locked(duckdb_init_info info) {
         /* P4: register in shared table (other threads compile lazily) */
         udf_source_set(d->sql_name, d->source);
         /* Step 5: generate + EXECUTE macro DDL so the name is callable.
-         * Return-type mapping: i→luajit_i, f→luajit_f, b→luajit_b,
-         * v→luajit_vs (VARCHAR batch; args CAST to VARCHAR since luajit_vs
-         * takes VARCHAR columns). Previously the DDL was only stored in
-         * detail and never executed → "function does not exist" on call. */
-        const char *fn=*var=='i'?"luajit_i":*var=='f'?"luajit_f":*var=='b'?"luajit_b":"luajit_vs";
-        int vstr=(*var=='v');
+         * Style mapping: scalar → luajit_s (single ANY arg) / luajit_i/f/b;
+         * batch → luajit_vs (VARCHAR batch; args CAST to VARCHAR). */
+        const char *fn; int vstr=0;
+        if(!strcmp(style,"scalar")&&*var=='v'&&np==1)fn="luajit_s";
+        else if(*var=='i')fn="luajit_i";
+        else if(*var=='f')fn="luajit_f";
+        else if(*var=='b')fn="luajit_b";
+        else{fn="luajit_vs";vstr=1;}
         char buf[2048];int off=snprintf(buf,sizeof(buf),"CREATE OR REPLACE MACRO %s(",d->sql_name);
         for(int i=0;i<np;i++)off+=snprintf(buf+off,sizeof(buf)-off,"%sx%d",i>0?", ":"",i+1);
         off+=snprintf(buf+off,sizeof(buf)-off,") AS %s('",fn);

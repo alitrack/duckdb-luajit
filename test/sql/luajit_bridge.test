@@ -131,6 +131,38 @@ SELECT luajit_vs('lunar', '2023-03-22')
 ----
 2023年闰二月初一
 
+# ── auto style detection: scalar vs batch macros ──
+
+# scalar date-string UDF → luajit_s macro
+statement ok
+SELECT message FROM luajit_module(mode := 'quick_compile', sql_name := 'lunar_scalar',
+  source := 'return function(d) local y, m, dd = d:match("(%d+)-(%d+)-(%d+)") return y .. "年" .. m .. "月" .. dd .. "日" end')
+
+query T
+SELECT lunar_scalar('2026-08-03')
+----
+2026年08月03日
+
+# scalar numeric UDF (returns numeric-string) → luajit_i macro
+statement ok
+SELECT message FROM luajit_module(mode := 'quick_compile', sql_name := 'sq',
+  source := 'return function(x) return tostring(x * x) end')
+
+query I
+SELECT sq(7)
+----
+49
+
+# STRUCT UDF → luajit_s macro
+statement ok
+SELECT message FROM luajit_module(mode := 'quick_compile', sql_name := 'gfmt',
+  source := 'return function(a) local im = a.y local s = tostring(a.x) if im >= 0 then s = s .. "+" else s = s .. "-" im = -im end return s .. im .. "i" end')
+
+query T
+SELECT gfmt({x:3, y:-4})
+----
+3-4i
+
 # ── aggregate + table function smoke ──
 
 statement ok
