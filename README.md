@@ -1,6 +1,6 @@
 # luajit — DuckDB LuaJIT UDF Extension  v0.30
 
-Self-contained DuckDB extension for Lua expressions, JIT-compiled UDFs, and nested type bridges via LuaJIT. ~700KB, MIT licensed.
+Self-contained DuckDB extension for Lua expressions, JIT-compiled UDFs, and nested type bridges via LuaJIT. ~1MB, MIT licensed.
 
 > **v0.30 changes**: `_duckdb_query` result bridge now reads integer columns at their
 > true physical width — INTEGER/SMALLINT/TINYINT and unsigned variants were previously
