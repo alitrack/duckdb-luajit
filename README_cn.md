@@ -42,8 +42,27 @@ libs 仓库分类：`datasource`（读文件/目录）/ `parser`（JSON 等）/ 
 | `luajit_l` | LIST 输入（任意子类型） |
 | `luajit_vs/vi` | 批量（chunk-batched）VARCHAR/BIGINT UDF |
 | `luajit_agg` | 聚合 UDF（BIGINT/DOUBLE） |
-| `luajit_table` | 表函数（table 行 / coroutine.wrap generator 流式） |
-| `luajit_module` | quick_compile（注册 UDF）、last_error 等控制面 |
+| `luajit_table` | 表函数（table 行 / coroutine.wrap 流式 generator） |
+| `luajit_module` | install（从 duckdb-luajit-libs 拉库）、list_remote、quick_compile（注册 UDF）、last_error 等控制面 |
+
+## 远程库（install / list_remote）
+
+[duckdb-luajit-libs](https://github.com/alitrack/duckdb-luajit-libs) 仓库的库可以
+一行 SQL 安装——拉取、缓存到 `~/.duckdb/luajit-libs/`、注册（UDF 或模块表）：
+
+```sql
+LOAD 'luajit';
+SELECT * FROM luajit_module(mode := 'list_remote');   -- 看有哪些库
+SELECT * FROM luajit_module(mode := 'install', sql_name := 'export');  -- 一行安装
+-- export 是标量 UDF：注册宏后即可 SQL 层调用
+SELECT * FROM luajit_module(mode := 'quick_compile', sql_name := 'export',
+                            source := (SELECT content FROM read_text('/home/USER/.duckdb/luajit-libs/export.lua')));
+-- 或直接经 luajit_s / luajit_table 调用：
+SELECT luajit_s('export', {query: 'SELECT 1', file: '/tmp/out.parquet'});
+SELECT * FROM luajit_table('dirscan', list := '/path/to/files');
+```
+
+离线：库缓存后 `install` 和 `list_remote` 无需网络（先查本地缓存，INDEX 也会缓存）。
 
 ## 安全
 

@@ -50,7 +50,28 @@ guidelines.
 | `luajit_vs/vi` | Batch (chunk-batched) VARCHAR/BIGINT UDFs |
 | `luajit_agg` | Aggregate UDFs (BIGINT/DOUBLE) |
 | `luajit_table` | Table function (table rows / coroutine.wrap streaming generator) |
-| `luajit_module` | quick_compile (register UDFs), last_error, and other control surface |
+| `luajit_module` | install (fetch lib from duckdb-luajit-libs), list_remote, quick_compile (register UDFs), last_error, and other control surface |
+
+## Remote libs (install / list_remote)
+
+Libraries from the [duckdb-luajit-libs](https://github.com/alitrack/duckdb-luajit-libs)
+repo can be installed with one SQL call — fetched, cached to
+`~/.duckdb/luajit-libs/`, and registered (UDF or module table):
+
+```sql
+LOAD 'luajit';
+SELECT * FROM luajit_module(mode := 'list_remote');   -- what's available
+SELECT * FROM luajit_module(mode := 'install', sql_name := 'export');  -- one-line install
+-- export is a scalar UDF: register a macro for SQL-level calls
+SELECT * FROM luajit_module(mode := 'quick_compile', sql_name := 'export',
+                            source := (SELECT content FROM read_text('/home/USER/.duckdb/luajit-libs/export.lua')));
+-- or call directly via luajit_s / luajit_table:
+SELECT luajit_s('export', {query: 'SELECT 1', file: '/tmp/out.parquet'});
+SELECT * FROM luajit_table('dirscan', list := '/path/to/files');
+```
+
+Offline: once a lib is cached, `install` and `list_remote` work without network
+(local cache is checked first; INDEX is cached too).
 
 ## Security
 
