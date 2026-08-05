@@ -48,6 +48,7 @@ static void lua_lock_init(void) { InitializeCriticalSection(&g_udf_lock); }
 #define LUA_UNLOCK() LeaveCriticalSection(&g_udf_lock)
 #else
 #include <pthread.h>
+#include <sys/stat.h>
 static pthread_mutex_t g_udf_lock;
 static void lua_lock_init(void) {
     pthread_mutexattr_t attr;
@@ -1551,6 +1552,177 @@ typedef struct {
 } bind_t;
 typedef struct { bool done; } state_t;
 
+/* ── install mode helpers: fetch lib source from duckdb-luajit-libs ── */
+
+/* Fetch URL content via DuckDB read_text (httpfs). Returns strdup'd content
+ * or NULL (err_out gets a strdup'd reason). Must not hold LUA_LOCK. */
+static char *fetch_url_content(const char *url, char **err_out) {
+    if (!g_conn) { if (err_out) *err_out = strdup("no connection"); return NULL; }
+    duckdb_result rres;
+    LUA_LOCK();
+    /* httpfs is required for https read_text; LOAD is idempotent-ish */
+    duckdb_result tmp;
+    duckdb_query(g_conn, "LOAD httpfs", &tmp);
+    duckdb_destroy_result(&tmp);
+    /* escape single quotes in URL before embedding in SQL */
+    char *q = (char *)duckdb_malloc(strlen(url) * 2 + 64);
+    char *p = q;
+    p += sprintf(p, "SELECT content FROM read_text('");
+    for (const char *u = url; *u; u++) {
+        if (*u == '\'') *p++ = '\'';
+        *p++ = *u;
+    }
+    p += sprintf(p, "')");
+    duckdb_state st = duckdb_query(g_conn, q, &rres);
+    duckdb_free(q);
+    LUA_UNLOCK();
+    if (st != DuckDBSuccess) {
+        if (err_out) {
+            const char *e = duckdb_result_error(&rres);
+            *err_out = strdup(e ? e : "read_text failed");
+        }
+        duckdb_destroy_result(&rres);
+        return NULL;
+    }
+    char *out = NULL;
+    duckdb_data_chunk chunk;
+    while ((chunk = duckdb_fetch_chunk(rres)) != NULL) {
+        idx_t nrows = duckdb_data_chunk_get_size(chunk);
+        if (nrows > 0) {
+            duckdb_vector v = duckdb_data_chunk_get_vector(chunk, 0);
+            duckdb_string_t s = ((duckdb_string_t *)duckdb_vector_get_data(v))[0];
+            uint32_t slen = duckdb_string_t_length(s);
+            const char *sdata = duckdb_string_t_data(&s);
+            if (sdata) {
+                out = (char *)malloc((size_t)slen + 1);
+                memcpy(out, sdata, slen);
+                out[slen] = 0;
+            }
+        }
+        duckdb_destroy_data_chunk(&chunk);
+        if (out) break;
+    }
+    duckdb_destroy_result(&rres);
+    if (!out && err_out) *err_out = strdup("empty response");
+    return out;
+}
+
+/* Write content to a cache file, creating the directory if needed. */
+static int cache_write_file(const char *path, const char *content) {
+    char dir[2048];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = 0;
+#ifdef _MSC_VER
+        _mkdir(dir);
+#else
+        mkdir(dir, 0755);
+#endif
+        *slash = '/';
+    }
+    FILE *fp = fopen(path, "w");
+    if (!fp) return 0;
+    fputs(content, fp);
+    fclose(fp);
+    return 1;
+}
+
+/* Resolve a lib name to source: local cache → INDEX → fetch. Caller frees. */
+static char *lib_fetch_source(bind_t *d, const char *name, char **err_out) {
+    const char *home = getenv("HOME");
+#ifdef _MSC_VER
+    if (!home) home = getenv("USERPROFILE");
+#endif
+    if (!home) home = ".";
+    char cache_file[2048];
+    snprintf(cache_file, sizeof(cache_file), "%s/.duckdb/luajit-libs/%s.lua", home, name);
+
+    /* 1. local cache */
+    FILE *fp = fopen(cache_file, "r");
+    if (fp) {
+        fseek(fp, 0, SEEK_END);
+        long sz = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        char *src = (char *)malloc((size_t)sz + 1);
+        size_t rd = fread(src, 1, (size_t)sz, fp);
+        src[rd] = 0;
+        fclose(fp);
+        return src;
+    }
+
+    /* 2. fetch: direct URL override (source param) or INDEX lookup */
+    const char *base = "https://raw.githubusercontent.com/alitrack/duckdb-luajit-libs/main";
+    char url[2048];
+    if (d->source && (strstr(d->source, "http://") || strstr(d->source, "https://"))) {
+        snprintf(url, sizeof(url), "%s", d->source);
+    } else {
+        char idx_url[2048];
+        snprintf(idx_url, sizeof(idx_url), "%s/INDEX", base);
+        char *idx = fetch_url_content(idx_url, err_out);
+        if (!idx) return NULL;
+        char path[1024] = "";
+        char *save = NULL;
+        char *line = strtok_r(idx, "\n", &save);
+        while (line) {
+            char *pipe = strchr(line, '|');
+            if (pipe) {
+                *pipe = 0;
+                if (!strcmp(line, name)) {
+                    snprintf(path, sizeof(path), "%s", pipe + 1);
+                    break;
+                }
+            }
+            line = strtok_r(NULL, "\n", &save);
+        }
+        free(idx);
+        if (!path[0]) {
+            char b[512];
+            snprintf(b, sizeof(b), "lib '%s' not found in INDEX", name);
+            if (err_out) *err_out = strdup(b);
+            return NULL;
+        }
+        snprintf(url, sizeof(url), "%s/%s", base, path);
+    }
+
+    char *src = fetch_url_content(url, err_out);
+    if (!src) return NULL;
+    /* cache for offline reuse */
+    cache_write_file(cache_file, src);
+    return src;
+}
+
+/* Fetch the libs INDEX (name|path lines) with a local cache, so list_remote
+ * works offline after the first call. Caller frees. */
+static char *lib_fetch_index(char **err_out) {
+    const char *home = getenv("HOME");
+#ifdef _MSC_VER
+    if (!home) home = getenv("USERPROFILE");
+#endif
+    if (!home) home = ".";
+    char cache_file[2048];
+    snprintf(cache_file, sizeof(cache_file), "%s/.duckdb/luajit-libs/INDEX", home);
+
+    FILE *fp = fopen(cache_file, "r");
+    if (fp) {
+        fseek(fp, 0, SEEK_END);
+        long sz = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        char *idx = (char *)malloc((size_t)sz + 1);
+        size_t rd = fread(idx, 1, (size_t)sz, fp);
+        idx[rd] = 0;
+        fclose(fp);
+        return idx;
+    }
+    char idx_url[2048];
+    snprintf(idx_url, sizeof(idx_url),
+             "https://raw.githubusercontent.com/alitrack/duckdb-luajit-libs/main/INDEX");
+    char *idx = fetch_url_content(idx_url, err_out);
+    if (!idx) return NULL;
+    cache_write_file(cache_file, idx);
+    return idx;
+}
+
 static void mod_bind(duckdb_bind_info info) {
     bind_t *d=(bind_t*)duckdb_malloc(sizeof(bind_t));
     memset(d,0,sizeof(*d));d->mode=strdup("info");
@@ -1855,6 +2027,91 @@ static void mod_init_locked(duckdb_init_info info) {
         }
 
         d->ok=true;d->sql_name=strdup(d->sql_name);d->detail=strdup(buf);
+        return;
+    }
+
+    /* ── install mode: fetch lib from duckdb-luajit-libs, cache, register ── */
+    if(!strcmp(m,"install")){
+        if(!d->sql_name){d->msg=strdup("need sql_name (lib name) for install");return;}
+        const char *name = d->sql_name;
+        char *err = NULL;
+        char *src = lib_fetch_source(d, name, &err);
+        if(!src){
+            char b[1024];
+            snprintf(b,sizeof(b),"install '%s' failed: %s",name,err?err:"unknown error");
+            d->msg=strdup(b);
+            free(err);
+            return;
+        }
+        /* compile: loadstring → pcall → expect function (UDF) or table (module) */
+        L_();lua_State *L=g_lua;
+        if(!L){d->msg=strdup("no Lua");free(src);return;}
+        if(luaL_loadstring(L,src)!=LUA_OK){
+            char b[1024];snprintf(b,sizeof(b),"install '%s': %s",name,lua_tostring(L,-1));
+            d->msg=strdup(b);lua_pop(L,1);free(src);return;
+        }
+        if(lua_pcall(L,0,1,0)!=LUA_OK){
+            char b[1024];snprintf(b,sizeof(b),"install '%s': %s",name,lua_tostring(L,-1));
+            d->msg=strdup(b);lua_pop(L,1);free(src);return;
+        }
+        bool isfn = lua_isfunction(L,-1);
+        bool istbl = lua_istable(L,-1);
+        if(!isfn && !istbl){
+            char b[1024];snprintf(b,sizeof(b),"install '%s': lib must return a function or table",name);
+            d->msg=strdup(b);lua_pop(L,1);free(src);return;
+        }
+        if(isfn){
+            lua_setglobal(L,name);
+            /* P4: shared table (other threads compile lazily) + persistence */
+            udf_source_set(name, src);
+            lua_getglobal(L,"_UDF_SOURCES");
+            if(!lua_istable(L,-1)){lua_pop(L,1);lua_newtable(L);lua_setglobal(L,"_UDF_SOURCES");lua_getglobal(L,"_UDF_SOURCES");}
+            lua_pushstring(L,src);lua_setfield(L,-2,name);lua_pop(L,1);
+        } else {
+            /* module table (e.g. json): register as global for dofile-style use */
+            lua_setglobal(L,name);
+        }
+        d->ok=true;d->phase="install";d->sql_name=strdup(name);
+        char b[2048];
+        snprintf(b,sizeof(b),"installed '%s' (%s) — cached at ~/.duckdb/luajit-libs/%s.lua",name,
+            isfn?"UDF":"module table",name);
+        d->msg=strdup(b);
+        if(isfn)
+            snprintf(b,sizeof(b),"luajit_table('%s') or luajit_s('%s', ...)",name,name);
+        else
+            snprintf(b,sizeof(b),"module: reference global '%s' from other UDFs, or dofile the cached file",name);
+        d->detail=strdup(b);
+        free(src);
+        return;
+    }
+
+    /* ── list_remote mode: show libs available in duckdb-luajit-libs ── */
+    if(!strcmp(m,"list_remote")){
+        char *err = NULL;
+        char *idx = lib_fetch_index(&err);
+        if(!idx){
+            char b[1024];
+            snprintf(b,sizeof(b),"list_remote failed: %s",err?err:"unknown error");
+            d->msg=strdup(b);
+            free(err);
+            return;
+        }
+        /* render name — path per line, cache hint on first fetch */
+        char *out = (char *)duckdb_malloc(strlen(idx) * 2 + 128);
+        char *p = out;
+        p += sprintf(p, "available libs:\n");
+        char *save = NULL;
+        char *line = strtok_r(idx, "\n", &save);
+        while (line) {
+            char *pipe = strchr(line, '|');
+            if (pipe) {
+                *pipe = 0;
+                p += sprintf(p, "  %s — %s\n", line, pipe + 1);
+            }
+            line = strtok_r(NULL, "\n", &save);
+        }
+        free(idx);
+        d->ok=true;d->phase="list_remote";d->msg=strdup("duckdb-luajit-libs");d->detail=out;
         return;
     }
 
