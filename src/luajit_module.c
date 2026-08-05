@@ -495,9 +495,10 @@ static void fj(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out)
 
 /* Record a resolve failure into g_last_error (LUA_LOCK-protected). */
 static void record_resolve_error(const char *name, const char *detail) {
-    char buf[640];
+    char buf[720];
     snprintf(buf, sizeof(buf),
-             "UDF '%s' %s — register it first with luajit_module(mode:='compile'|'install', sql_name:='%s', ...)",
+             "UDF '%s' %s — use one of: luajit_module(mode:='compile'|'install', sql_name:='%s', ...), "
+             "or pass anonymous function source: luajit_i('function(x) return ... end', arg)",
              name, detail, name);
     LUA_LOCK();
     free(g_last_error);
@@ -513,7 +514,7 @@ static int resolve_udf_chunk(lua_State *L, duckdb_vector nv) {
      * the heap is a contiguous buffer — strlen() can run past the value into
      * an adjacent string's bytes (seen as 0x08). Copy the exact length. */
     size_t nlen = duckdb_string_t_length(ns);
-    char nbuf[512];
+    char nbuf[384];
     if (nlen >= sizeof(nbuf)) return LUA_NOREF;
     memcpy(nbuf, name, nlen);
     nbuf[nlen] = 0;
@@ -527,28 +528,50 @@ static int resolve_udf_chunk(lua_State *L, duckdb_vector nv) {
     LUA_LOCK();
     char *src = udf_source_get(name);
     LUA_UNLOCK();
-    if (!src) {
-        if (existed)
-            record_resolve_error(name, "exists but is not a function (module table?)");
-        else
-            record_resolve_error(name, "is not registered");
-        return LUA_NOREF;
+    if (src) {
+        int ref = LUA_NOREF;
+        if (luaL_loadstring(L, src) == LUA_OK && lua_pcall(L, 0, 1, 0) == LUA_OK &&
+            lua_isfunction(L, -1)) {
+            lua_pushvalue(L, -1);
+            lua_setglobal(L, name);  /* cache in this state */
+            ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        } else {
+            const char *cerr = lua_tostring(L, -1);
+            char ebuf[640];
+            snprintf(ebuf, sizeof(ebuf), "compile failed: %s", cerr ? cerr : "unknown");
+            record_resolve_error(name, ebuf);
+            lua_pop(L, lua_gettop(L));  /* drop load/compile error */
+        }
+        free(src);
+        return ref;
     }
-    int ref = LUA_NOREF;
-    if (luaL_loadstring(L, src) == LUA_OK && lua_pcall(L, 0, 1, 0) == LUA_OK &&
+    /* ── Anonymous function fallback (v0.31): treat the name as Lua source.
+     * Use-and-discard: compiled into this state's registry, NOT setglobal,
+     * NOT persisted — freed by the caller's luaL_unref at chunk end.
+     * Two styles, tried in order:
+     *   1. body style:  'return x * 2'            → return function(x) return x*2 end
+     *                   (x is bound to the first argument)
+     *   2. expression:  'function(a,b) return a+b end' → return function(a,b) ... end
+     * Both compile the source INSIDE a function so the pcall only creates the
+     * closure — top-level side effects of the source never run twice. */
+    char wrapped[768];
+    snprintf(wrapped, sizeof(wrapped), "return function(x) %s end", name);
+    if (luaL_loadstring(L, wrapped) == LUA_OK && lua_pcall(L, 0, 1, 0) == LUA_OK &&
         lua_isfunction(L, -1)) {
-        lua_pushvalue(L, -1);
-        lua_setglobal(L, name);  /* cache in this state */
-        ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    } else {
-        const char *cerr = lua_tostring(L, -1);
-        char ebuf[640];
-        snprintf(ebuf, sizeof(ebuf), "compile failed: %s", cerr ? cerr : "unknown");
-        record_resolve_error(name, ebuf);
-        lua_pop(L, lua_gettop(L));  /* drop load/compile error */
+        return luaL_ref(L, LUA_REGISTRYINDEX);
     }
-    free(src);
-    return ref;
+    lua_pop(L, lua_gettop(L));
+    snprintf(wrapped, sizeof(wrapped), "return %s", name);
+    if (luaL_loadstring(L, wrapped) == LUA_OK && lua_pcall(L, 0, 1, 0) == LUA_OK &&
+        lua_isfunction(L, -1)) {
+        return luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+    lua_pop(L, lua_gettop(L));
+    if (existed)
+        record_resolve_error(name, "exists but is not a function (module table?)");
+    else
+        record_resolve_error(name, "is not registered and not a function source");
+    return LUA_NOREF;
 }
 
 /* Mark all rows of a result vector invalid (unresolved UDF). */
