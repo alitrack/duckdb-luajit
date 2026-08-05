@@ -14,12 +14,20 @@ Self-contained DuckDB extension for Lua expressions, JIT-compiled UDFs, and nest
 
 ```sql
 LOAD 'luajit';
--- JIT-compiled Lua expressions / scalar UDFs
-SELECT luajit_i('return x * 2', 21) AS r;          -- 42
-SELECT luajit_s('return "hello " .. x', 'world');  -- hello world
+-- Register a UDF first (compile mode), then call it by its registered name.
+-- Scalar UDF first argument is the REGISTERED NAME, not Lua source.
+SELECT * FROM luajit_module(mode := 'compile', sql_name := 'x2',
+                            source := 'return function(x) return x * 2 end');
+SELECT luajit_i('x2', 21) AS r;          -- 42
+SELECT * FROM luajit_module(mode := 'compile', sql_name := 'hello',
+                            source := 'return function(x) return "hello " .. x end');
+SELECT luajit_s('hello', 'world');        -- hello world
 -- Table function: Lua source → rows
 SELECT * FROM luajit_table('return {"a", "b", "c"}');
 ```
+
+`luajit_module(mode:='compile', sql_name:='NAME', source:='...')` registers the
+UDF; `quick_compile` additionally auto-probes return type and creates a SQL macro.
 
 ## Lua Libraries (libs) — Load Functions/Table Functions with One SQL
 

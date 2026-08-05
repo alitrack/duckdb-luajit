@@ -10,12 +10,20 @@
 
 ```sql
 LOAD 'luajit';
--- JIT 编译的 Lua 表达式/标量 UDF
-SELECT luajit_i('return x * 2', 21) AS r;          -- 42
-SELECT luajit_s('return "hello " .. x', 'world');  -- hello world
+-- 先注册 UDF（compile 模式），再用注册名调用。
+-- 标量 UDF 的第一个参数是「注册名」，不是 Lua 源码。
+SELECT * FROM luajit_module(mode := 'compile', sql_name := 'x2',
+                            source := 'return function(x) return x * 2 end');
+SELECT luajit_i('x2', 21) AS r;          -- 42
+SELECT * FROM luajit_module(mode := 'compile', sql_name := 'hello',
+                            source := 'return function(x) return "hello " .. x end');
+SELECT luajit_s('hello', 'world');        -- hello world
 -- 表函数：Lua 源码 → 多行
 SELECT * FROM luajit_table('return {"a", "b", "c"}');
 ```
+
+`luajit_module(mode:='compile', sql_name:='NAME', source:='...')` 注册 UDF；
+`quick_compile` 额外自动探测返回类型并创建 SQL 宏。
 
 ## Lua 库模式（libs）——一条 SQL 加载函数/表函数
 
