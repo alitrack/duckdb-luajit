@@ -1,14 +1,12 @@
-# luajit — DuckDB LuaJIT UDF Extension  v0.27
+# luajit — DuckDB LuaJIT UDF Extension  v0.30
 
 Self-contained DuckDB extension for Lua expressions, JIT-compiled UDFs, and nested type bridges via LuaJIT. ~700KB, MIT licensed.
 
-> **v0.27 changes**: `luajit_table` generator mode fixed — the coroutine.wrap
-> iterator was registered in the init thread's TLS lua_State but resumed from
-> other threads' TLS states (cross-state registry lookup → nil → intermittent
-> 0 rows). Fix: generator uses a shared non-TLS state (`lua_xmove` the
-> iterator there); all workers resume the same coroutine under the global
-> lock. Verified 100/100 independent runs + full SQLLogicTests. Built/tested
-> against DuckDB v1.5.5.
+> **v0.30 changes**: `_duckdb_query` result bridge now reads integer columns at their
+> true physical width — INTEGER/SMALLINT/TINYINT and unsigned variants were previously
+> all read as int64 (garbage values for non-BIGINT columns, e.g. `5` → `2147483648005`).
+> This makes the SQL callback bridge (stored-procedure style recipes) safe for
+> arbitrary integer columns.
 
 ## 快速开始
 
@@ -56,6 +54,9 @@ trusted 沙箱模式移除 `io/os/ffi/package/require/load*`（不可触文件�
 
 ## 版本历史
 
+- **v0.30**: `_duckdb_query` 结果桥整数列按真实物理宽度读（INTEGER/SMALLINT/TINYINT/无符号族——此前全按 int64 读，非 BIGINT 列读出垃圾值，如 5 → 2147483648005）；存储过程式回查配方安全
+- **v0.29**: `luajit_table` 表函数参数——list（路径列表，替代 io.popen 兜底）+ mode='blob'（BLOB 返回列，NUL 安全）；generator 写入改长度感知
+- **v0.28**: BLOB 桥——`luajit_blob` 标量函数（Lua 字符串 ↔ BLOB，NUL 安全）+ BLOB 参数支持（fjs 长度感知写入）
 - **v0.27**: generator 共享非 TLS state 修复（跨线程 registry 错位）；v1.5.5 对齐
 - **v0.24**: `luajit_table` 串行执行（`set_max_threads(1)`）；CI 构建矩阵 `skip_tests: true`（macOS arm64/Windows 行为差异），新增 `sqllogictest-linux` job
 - **v0.23**: quick_compile 自动识别 UDF 风格（标量→`luajit_s/i/f/b`、批量→`luajit_vs`）；`luajit_s` 接受任意标量参数

@@ -304,11 +304,22 @@ static int l_duckdb_query(lua_State *L) {
                 lua_pushstring(L, duckdb_column_name(&res, c));
                 if (validity && !duckdb_validity_row_is_valid(validity, r)) {
                     lua_pushnil(L);
-                } else if (ct == DUCKDB_TYPE_BIGINT || ct == DUCKDB_TYPE_INTEGER ||
-                           ct == DUCKDB_TYPE_SMALLINT || ct == DUCKDB_TYPE_TINYINT ||
-                           ct == DUCKDB_TYPE_UBIGINT || ct == DUCKDB_TYPE_UINTEGER ||
-                           ct == DUCKDB_TYPE_USMALLINT || ct == DUCKDB_TYPE_UTINYINT) {
+                } else if (ct == DUCKDB_TYPE_BIGINT) {
                     lua_pushnumber(L, (lua_Number)((int64_t *)data)[r]);
+                } else if (ct == DUCKDB_TYPE_INTEGER) {
+                    lua_pushnumber(L, (lua_Number)((int32_t *)data)[r]);
+                } else if (ct == DUCKDB_TYPE_SMALLINT) {
+                    lua_pushnumber(L, (lua_Number)((int16_t *)data)[r]);
+                } else if (ct == DUCKDB_TYPE_TINYINT) {
+                    lua_pushnumber(L, (lua_Number)((int8_t *)data)[r]);
+                } else if (ct == DUCKDB_TYPE_UBIGINT) {
+                    lua_pushnumber(L, (lua_Number)((uint64_t *)data)[r]);
+                } else if (ct == DUCKDB_TYPE_UINTEGER) {
+                    lua_pushnumber(L, (lua_Number)((uint32_t *)data)[r]);
+                } else if (ct == DUCKDB_TYPE_USMALLINT) {
+                    lua_pushnumber(L, (lua_Number)((uint16_t *)data)[r]);
+                } else if (ct == DUCKDB_TYPE_UTINYINT) {
+                    lua_pushnumber(L, (lua_Number)((uint8_t *)data)[r]);
                 } else if (ct == DUCKDB_TYPE_DOUBLE || ct == DUCKDB_TYPE_FLOAT) {
                     lua_pushnumber(L, ((double *)data)[r]);
                 } else if (ct == DUCKDB_TYPE_BOOLEAN) {
