@@ -485,7 +485,26 @@ static void fj(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out)
  * resolve_udf_chunk: resolve UDF name from chunk row 0 → registry ref.
  *   LUA_NOREF if name is NULL or not a function. One global lookup per chunk
  *   instead of per row (old resolve_udf did a lua_getglobal for every row).
+ *
+ * Debuggability (v0.31): a failed resolve now writes g_last_error with the
+ * reason (not registered / not a function / compile failed), so a silent-NULL
+ * scalar UDF call can be diagnosed via luajit_module(mode:='last_error')
+ * instead of guessing. NULL row-0 names are NOT an error (DuckDB NULL
+ * propagation short-circuits the UDF — expected behaviour).
  */
+
+/* Record a resolve failure into g_last_error (LUA_LOCK-protected). */
+static void record_resolve_error(const char *name, const char *detail) {
+    char buf[640];
+    snprintf(buf, sizeof(buf),
+             "UDF '%s' %s — register it first with luajit_module(mode:='compile'|'install', sql_name:='%s', ...)",
+             name, detail, name);
+    LUA_LOCK();
+    free(g_last_error);
+    g_last_error = strdup(buf);
+    LUA_UNLOCK();
+}
+
 static int resolve_udf_chunk(lua_State *L, duckdb_vector nv) {
     duckdb_string_t ns=((duckdb_string_t*)duckdb_vector_get_data(nv))[0];
     if(!duckdb_validity_row_is_valid(duckdb_vector_get_validity(nv),0)) return LUA_NOREF;
@@ -501,13 +520,20 @@ static int resolve_udf_chunk(lua_State *L, duckdb_vector nv) {
     name = nbuf;
     lua_getglobal(L,name);
     if(lua_isfunction(L,-1)) return luaL_ref(L,LUA_REGISTRYINDEX);
+    bool existed = !lua_isnil(L, -1);   /* registered under this name but not a function */
     lua_pop(L,1);
     /* P4: UDF may have been compiled on another thread's state — lazily
      * compile from the shared source table into this thread's state. */
     LUA_LOCK();
     char *src = udf_source_get(name);
     LUA_UNLOCK();
-    if (!src) return LUA_NOREF;
+    if (!src) {
+        if (existed)
+            record_resolve_error(name, "exists but is not a function (module table?)");
+        else
+            record_resolve_error(name, "is not registered");
+        return LUA_NOREF;
+    }
     int ref = LUA_NOREF;
     if (luaL_loadstring(L, src) == LUA_OK && lua_pcall(L, 0, 1, 0) == LUA_OK &&
         lua_isfunction(L, -1)) {
@@ -515,6 +541,10 @@ static int resolve_udf_chunk(lua_State *L, duckdb_vector nv) {
         lua_setglobal(L, name);  /* cache in this state */
         ref = luaL_ref(L, LUA_REGISTRYINDEX);
     } else {
+        const char *cerr = lua_tostring(L, -1);
+        char ebuf[640];
+        snprintf(ebuf, sizeof(ebuf), "compile failed: %s", cerr ? cerr : "unknown");
+        record_resolve_error(name, ebuf);
         lua_pop(L, lua_gettop(L));  /* drop load/compile error */
     }
     free(src);
@@ -1423,8 +1453,31 @@ static void tbt_init(duckdb_init_info info) {
         if (!lua_isfunction(L, -1)) {
             lua_pop(L, 1);
             /* Compile inline source → function on stack */
-            if (luaL_loadstring(L, d->source) != LUA_OK) { lua_pop(L, 1); LUA_UNLOCK(); return; }
-            if (lua_pcall(L, 0, 1, 0) != LUA_OK) { lua_pop(L, 1); LUA_UNLOCK(); return; }
+            if (luaL_loadstring(L, d->source) != LUA_OK) {
+                /* Debuggability: surface Lua syntax errors instead of silent 0 rows */
+                char ebuf[640];
+                snprintf(ebuf, sizeof(ebuf), "luajit_table source compile: %s",
+                         lua_tostring(L, -1) ? lua_tostring(L, -1) : "unknown");
+                lua_pop(L, 1);
+                LUA_LOCK();
+                free(g_last_error);
+                g_last_error = strdup(ebuf);
+                LUA_UNLOCK();
+                LUA_UNLOCK();
+                return;
+            }
+            if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
+                char ebuf[640];
+                snprintf(ebuf, sizeof(ebuf), "luajit_table source exec: %s",
+                         lua_tostring(L, -1) ? lua_tostring(L, -1) : "unknown");
+                lua_pop(L, 1);
+                LUA_LOCK();
+                free(g_last_error);
+                g_last_error = strdup(ebuf);
+                LUA_UNLOCK();
+                LUA_UNLOCK();
+                return;
+            }
         }
         /* Result dispatch (executed source is on the stack):
          *  - C function (coroutine.wrap iterator) → streaming generator mode
