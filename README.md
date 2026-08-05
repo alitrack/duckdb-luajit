@@ -14,20 +14,25 @@ Self-contained DuckDB extension for Lua expressions, JIT-compiled UDFs, and nest
 
 ```sql
 LOAD 'luajit';
--- Register a UDF first (compile mode), then call it by its registered name.
--- Scalar UDF first argument is the REGISTERED NAME, not Lua source.
+-- Anonymous function: pass Lua source directly — use-and-discard, no registration.
+-- Body style: 'return <expr>' (x binds to the first argument):
+SELECT luajit_i('return x * 2', 21) AS r;                    -- 42
+SELECT luajit_s('return "hello " .. x', 'world');            -- hello world
+-- Expression style (multi-arg):
+SELECT luajit_i('function(a, b) return a + b end', 20, 22);  -- 42
+-- Registered UDF: compile once, reuse by name (hot paths — compiled once per
+-- session, not per chunk):
 SELECT * FROM luajit_module(mode := 'compile', sql_name := 'x2',
                             source := 'return function(x) return x * 2 end');
-SELECT luajit_i('x2', 21) AS r;          -- 42
-SELECT * FROM luajit_module(mode := 'compile', sql_name := 'hello',
-                            source := 'return function(x) return "hello " .. x end');
-SELECT luajit_s('hello', 'world');        -- hello world
+SELECT luajit_i('x2', 21) AS r;                              -- 42
 -- Table function: Lua source → rows
 SELECT * FROM luajit_table('return {"a", "b", "c"}');
 ```
 
 `luajit_module(mode:='compile', sql_name:='NAME', source:='...')` registers the
 UDF; `quick_compile` additionally auto-probes return type and creates a SQL macro.
+Anonymous source is compiled per chunk (use-and-discard); registered names are
+reused (compile once per session) — prefer registration for hot paths.
 
 ## Lua Libraries (libs) — Load Functions/Table Functions with One SQL
 

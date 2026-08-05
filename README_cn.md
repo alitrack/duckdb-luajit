@@ -10,20 +10,23 @@
 
 ```sql
 LOAD 'luajit';
--- 先注册 UDF（compile 模式），再用注册名调用。
--- 标量 UDF 的第一个参数是「注册名」，不是 Lua 源码。
+-- 匿名函数：直接传 Lua 源码，用完即销，无需注册。
+-- body 风格：'return <表达式>'（x 自动绑定第一参数）：
+SELECT luajit_i('return x * 2', 21) AS r;                    -- 42
+SELECT luajit_s('return "hello " .. x', 'world');            -- hello world
+-- 表达式风格（支持多参数）：
+SELECT luajit_i('function(a, b) return a + b end', 20, 22);  -- 42
+-- 注册 UDF：编译一次、按名复用（热路径——每会话编译一次，而非每 chunk）：
 SELECT * FROM luajit_module(mode := 'compile', sql_name := 'x2',
                             source := 'return function(x) return x * 2 end');
-SELECT luajit_i('x2', 21) AS r;          -- 42
-SELECT * FROM luajit_module(mode := 'compile', sql_name := 'hello',
-                            source := 'return function(x) return "hello " .. x end');
-SELECT luajit_s('hello', 'world');        -- hello world
+SELECT luajit_i('x2', 21) AS r;                              -- 42
 -- 表函数：Lua 源码 → 多行
 SELECT * FROM luajit_table('return {"a", "b", "c"}');
 ```
 
 `luajit_module(mode:='compile', sql_name:='NAME', source:='...')` 注册 UDF；
 `quick_compile` 额外自动探测返回类型并创建 SQL 宏。
+匿名源码每 chunk 编译一次（用完即销）；注册名复用（每会话编译一次）——热路径建议注册。
 
 ## Lua 库模式（libs）——一条 SQL 加载函数/表函数
 
