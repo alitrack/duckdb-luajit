@@ -42,6 +42,7 @@ void luajit_register_module_functions(
  */
 #ifdef _WIN32
 #include <windows.h>
+#include <direct.h>   /* _mkdir for cache dir */
 static CRITICAL_SECTION g_udf_lock;
 static void lua_lock_init(void) { InitializeCriticalSection(&g_udf_lock); }
 #define LUA_LOCK()   EnterCriticalSection(&g_udf_lock)
@@ -1737,19 +1738,25 @@ static char *lib_fetch_source(bind_t *d, const char *name, char **err_out) {
         snprintf(idx_url, sizeof(idx_url), "%s/INDEX", base);
         char *idx = fetch_url_content(idx_url, err_out);
         if (!idx) return NULL;
+        /* parse "name|path" per line — manual scan, portable (no strtok_r) */
         char path[1024] = "";
-        char *save = NULL;
-        char *line = strtok_r(idx, "\n", &save);
-        while (line) {
-            char *pipe = strchr(line, '|');
+        const char *p = idx;
+        while (*p) {
+            const char *nl = strchr(p, '\n');
+            size_t linelen = nl ? (size_t)(nl - p) : strlen(p);
+            const char *pipe = (const char *)memchr(p, '|', linelen);
             if (pipe) {
-                *pipe = 0;
-                if (!strcmp(line, name)) {
-                    snprintf(path, sizeof(path), "%s", pipe + 1);
+                size_t namelen = (size_t)(pipe - p);
+                if (namelen == strlen(name) && !memcmp(p, name, namelen)) {
+                    size_t pathlen = linelen - namelen - 1;
+                    if (pathlen >= sizeof(path)) pathlen = sizeof(path) - 1;
+                    memcpy(path, pipe + 1, pathlen);
+                    path[pathlen] = 0;
                     break;
                 }
             }
-            line = strtok_r(NULL, "\n", &save);
+            if (!nl) break;
+            p = nl + 1;
         }
         free(idx);
         if (!path[0]) {
@@ -2176,15 +2183,20 @@ static void mod_init_locked(duckdb_init_info info) {
         char *out = (char *)duckdb_malloc(strlen(idx) * 2 + 128);
         char *p = out;
         p += sprintf(p, "available libs:\n");
-        char *save = NULL;
-        char *line = strtok_r(idx, "\n", &save);
-        while (line) {
-            char *pipe = strchr(line, '|');
+        /* manual line scan — portable (no strtok_r) */
+        const char *lp = idx;
+        while (*lp) {
+            const char *nl = strchr(lp, '\n');
+            size_t linelen = nl ? (size_t)(nl - lp) : strlen(lp);
+            const char *pipe = (const char *)memchr(lp, '|', linelen);
             if (pipe) {
-                *pipe = 0;
-                p += sprintf(p, "  %s — %s\n", line, pipe + 1);
+                size_t namelen = (size_t)(pipe - lp);
+                size_t pathlen = linelen - namelen - 1;
+                p += sprintf(p, "  %.*s — %.*s\n", (int)namelen, lp,
+                             (int)pathlen, pipe + 1);
             }
-            line = strtok_r(NULL, "\n", &save);
+            if (!nl) break;
+            lp = nl + 1;
         }
         free(idx);
         d->ok=true;d->phase="list_remote";d->msg=strdup("duckdb-luajit-libs");d->detail=out;
