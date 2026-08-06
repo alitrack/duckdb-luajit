@@ -687,8 +687,8 @@ static void fjv(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     }
 
     /* Call UDF(t1, t2, ...) once per chunk — func already at bottom */
-    if (!call_udf(fi, L, nargs, 1)) { luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
-    if (!lua_istable(L, -1)) { lua_pop(L, lua_gettop(L)); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
+    if (!call_udf(fi, L, nargs, 1)) { invalidate_all(out, nr); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
+    if (!lua_istable(L, -1)) { invalidate_all(out, nr); lua_pop(L, lua_gettop(L)); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
 
     /* Unpack result table → output vector */
     idx_t rlen = (idx_t)lua_objlen(L, -1);
@@ -697,6 +697,7 @@ static void fjv(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
         od[r] = lua_isnumber(L, -1) ? lua_tonumber(L, -1) : 0.0;
         lua_pop(L, 1);
     }
+    if (rlen < nr) invalidate_from(out, rlen, nr);   /* short result table → NULL tail */
     lua_pop(L, 1);
     luaL_unref(L, LUA_REGISTRYINDEX, udf_ref);
     LUA_CLEANUP();
@@ -728,8 +729,8 @@ static void fjvi(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector ou
         }
     }
 
-    if (!call_udf(fi, L, nargs, 1)) { luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
-    if (!lua_istable(L, -1)) { lua_pop(L, lua_gettop(L)); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
+    if (!call_udf(fi, L, nargs, 1)) { invalidate_all(out, nr); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
+    if (!lua_istable(L, -1)) { invalidate_all(out, nr); lua_pop(L, lua_gettop(L)); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
 
     idx_t rlen = (idx_t)lua_objlen(L, -1);
     for (idx_t r = 0; r < nr && r < rlen; r++) {
@@ -738,6 +739,7 @@ static void fjvi(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector ou
         else od[r] = lua_isnumber(L, -1) ? (int64_t)lua_tointeger(L, -1) : 0;
         lua_pop(L, 1);
     }
+    if (rlen < nr) invalidate_from(out, rlen, nr);   /* short result table → NULL tail */
     lua_pop(L, 1);
     luaL_unref(L, LUA_REGISTRYINDEX, udf_ref);
     LUA_CLEANUP();
@@ -771,8 +773,8 @@ static void fjvs(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector ou
         }
     }
 
-    if (!call_udf(fi, L, nargs, 1)) { luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
-    if (!lua_istable(L, -1)) { lua_pop(L, lua_gettop(L)); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
+    if (!call_udf(fi, L, nargs, 1)) { invalidate_all(out, nr); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
+    if (!lua_istable(L, -1)) { invalidate_all(out, nr); lua_pop(L, lua_gettop(L)); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
 
     idx_t rlen = (idx_t)lua_objlen(L, -1);
     for (idx_t r = 0; r < nr && r < rlen; r++) {
@@ -781,6 +783,7 @@ static void fjvs(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector ou
         else duckdb_vector_assign_string_element(out, r, lua_tostring(L, -1));
         lua_pop(L, 1);
     }
+    if (rlen < nr) invalidate_from(out, rlen, nr);   /* short result table → NULL tail */
     lua_pop(L, 1);
     luaL_unref(L, LUA_REGISTRYINDEX, udf_ref);
     LUA_CLEANUP();
