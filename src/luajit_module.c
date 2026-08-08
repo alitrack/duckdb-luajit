@@ -606,6 +606,32 @@ static NOINLINE int call_udf(duckdb_function_info fi, lua_State *L, int nargs, i
     return 1;
 }
 
+/* Batch executors (luajit_v/vi/vs) call UDFs with {table} args. A
+ * scalar-style UDF (function(x) ... end) fails with "attempt to ... (a
+ * table value)". Detect that pattern in g_last_error and append a hint
+ * pointing at the scalar executors — the raw Lua error gives no clue. */
+static void batch_error_hint(void) {
+    char *cur = NULL;
+    LUA_LOCK();
+    if (g_last_error) cur = strdup(g_last_error);
+    LUA_UNLOCK();
+    if (!cur) return;
+    if (strstr(cur, "table value")) {
+        char buf[1280];
+        snprintf(buf, sizeof(buf),
+                 "%s — hint: the UDF looks scalar-style (takes one value, "
+                 "returns one value); use luajit_s()/luajit_i()/luajit_f()/luajit_b() "
+                 "for that. luajit_v/vi/vs expect batch UDFs that take {table} "
+                 "args and return a table.",
+                 cur);
+        LUA_LOCK();
+        free(g_last_error);
+        g_last_error = strdup(buf);
+        LUA_UNLOCK();
+    }
+    free(cur);
+}
+
 /* Mark one row invalid — MUST ensure the validity mask is writable first:
  * DuckDB's fast path hands out NULL validity for NULL-free vectors, and
  * duckdb_validity_set_row_invalid(NULL) would crash. */
@@ -708,7 +734,7 @@ static void fjv(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     }
 
     /* Call UDF(t1, t2, ...) once per chunk — func already at bottom */
-    if (!call_udf(fi, L, nargs, 1)) { invalidate_all(out, nr); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
+    if (!call_udf(fi, L, nargs, 1)) { batch_error_hint(); invalidate_all(out, nr); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
     if (!lua_istable(L, -1)) { invalidate_all(out, nr); lua_pop(L, lua_gettop(L)); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
 
     /* Unpack result table → output vector */
@@ -765,7 +791,7 @@ static void fjvi(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector ou
         }
     }
 
-    if (!call_udf(fi, L, nargs, 1)) { invalidate_all(out, nr); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
+    if (!call_udf(fi, L, nargs, 1)) { batch_error_hint(); invalidate_all(out, nr); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
     if (!lua_istable(L, -1)) { invalidate_all(out, nr); lua_pop(L, lua_gettop(L)); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
 
     idx_t rlen = (idx_t)lua_objlen(L, -1);
@@ -824,7 +850,7 @@ static void fjvs(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector ou
         }
     }
 
-    if (!call_udf(fi, L, nargs, 1)) { invalidate_all(out, nr); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
+    if (!call_udf(fi, L, nargs, 1)) { batch_error_hint(); invalidate_all(out, nr); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
     if (!lua_istable(L, -1)) { invalidate_all(out, nr); lua_pop(L, lua_gettop(L)); luaL_unref(L, LUA_REGISTRYINDEX, udf_ref); goto lua_cleanup; }
 
     idx_t rlen = (idx_t)lua_objlen(L, -1);
