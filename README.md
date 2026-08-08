@@ -86,6 +86,34 @@ SELECT * FROM luajit_table('dirscan', list := '/path/to/files');
 Offline: once a lib is cached, `install` and `list_remote` work without network
 (local cache is checked first; INDEX is cached too).
 
+## UDF Lifecycle — persisted per database file (v0.32)
+
+Every registration (`compile` / `quick_compile` / `install` / `fennel` /
+`load`) is mirrored into a `luajit_udf_registry(name, source)` table **in the
+current database file**. On `LOAD luajit`, UDFs are restored from that table —
+so opening the SAME .db file again brings your UDFs back automatically:
+
+```sql
+-- session 1: register
+SELECT * FROM luajit_module(mode := 'install', sql_name := 'base64');
+-- session 2 (same .db file, new process): still works, no re-registration
+SELECT luajit_s('base64', 'hello');   -- aGVsbG8=
+```
+
+- **Scoped to the database file**: a *different* .db does NOT inherit another
+  database's UDFs (each db has its own registry table).
+- `drop` removes the UDF from the registry (no zombie resurrection after
+  restart); `reset` clears the whole registry.
+- `quick_compile` macros are catalog objects that persist with the db — their
+  UDF source persists in the registry too, so the macro keeps working after
+  restart.
+- Read-only databases: persistence is silently skipped (UDFs still work for
+  the session).
+- The `~/.duckdb/luajit-libs/` cache dir remains a *source* cache for offline
+  install; it is not scanned at load.
+- The explicit `save`/`load` file workflow still exists for migration/backup
+  (a file `load` is also mirrored into the registry).
+
 ## Security
 
 trusted sandbox mode removes `io/os/ffi/package/require/load*` (no filesystem /
@@ -94,6 +122,17 @@ FFI, `_duckdb_query` callback). Default: not trusted.
 
 ## Changelog
 
+- **v0.32**: UDF lifecycle closed loop — registrations persist into a
+  `luajit_udf_registry` table in the current database file; UDFs auto-restore
+  on `LOAD` when reopening the same .db, do NOT leak into other databases;
+  `drop`/`reset` also clear the registry (no zombie UDFs after restart);
+  `load`(file) mirrors into the registry. Anonymous source expressions
+  (`luajit_i('return x * 2', 21)` → 42, multi-arg expression style) verified
+  and documented (Quick Start)
+- **v0.31**: anonymous UDF source — scalar UDF first arg accepts Lua source
+  directly, use-and-discard; `luajit_module` install/list_remote (remote libs
+  from duckdb-luajit-libs, cached, offline reuse); linux_arm64 enabled;
+  failed-resolve `last_error` hints
 - **v0.30**: `_duckdb_query` result bridge reads integer columns at their true
   physical width (INTEGER/SMALLINT/TINYINT and unsigned — previously read as int64,
   garbage values for non-BIGINT columns, e.g. 5 → 2147483648005); stored-procedure

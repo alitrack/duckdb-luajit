@@ -75,6 +75,27 @@ SELECT * FROM luajit_table('dirscan', list := '/path/to/files');
 
 离线：库缓存后 `install` 和 `list_remote` 无需网络（先查本地缓存，INDEX 也会缓存）。
 
+## UDF 生命周期 —— 按数据库文件持久化（v0.32）
+
+所有注册（`compile` / `quick_compile` / `install` / `fennel` / `load`）都会镜像
+写入**当前数据库文件**内的 `luajit_udf_registry(name, source)` 表。`LOAD luajit`
+时从该表恢复 UDF——再次打开**同一个 .db 文件**自动带回已注册的 UDF：
+
+```sql
+-- 会话1：注册
+SELECT * FROM luajit_module(mode := 'install', sql_name := 'base64');
+-- 会话2（同一 .db 文件，新进程）：直接用，无需重新注册
+SELECT luajit_s('base64', 'hello');   -- aGVsbG8=
+```
+
+- **按库文件隔离**：*另一个* .db 不会继承本库的 UDF（每个库有自己的注册表）。
+- `drop` 同时删除注册表记录（重启后不会复活）；`reset` 清空整个注册表。
+- `quick_compile` 宏是随 db 文件持久化的 catalog 对象——其 UDF 源码也进注册表，
+  重启后宏继续可用。
+- 只读数据库：持久化静默跳过（会话内 UDF 照常可用）。
+- `~/.duckdb/luajit-libs/` 缓存目录仍是离线 install 的**源码缓存**，加载时不扫描。
+- 显式 `save`/`load` 文件工作流保留（迁移/备份用；文件 `load` 也会镜像进注册表）。
+
 ## 安全
 
 trusted 沙箱模式移除 `io/os/ffi/package/require/load*`（不可触文件系统/网络/系统调用）；
@@ -82,6 +103,13 @@ trusted 沙箱模式移除 `io/os/ffi/package/require/load*`（不可触文件�
 
 ## 版本历史
 
+- **v0.32**: UDF 生命周期闭环——注册写入当前数据库文件的 `luajit_udf_registry`
+  表，LOAD 时自动恢复；换库不串（各库注册表独立）；`drop`/`reset` 同步清注册表
+  （重启不复活）；文件 `load` 也镜像进注册表。匿名源码表达式
+  （`luajit_i('return x * 2', 21)` → 42、多参数表达式风格）已验证并写入快速开始
+- **v0.31**: 匿名 UDF 源码——标量 UDF 首参直接收 Lua 源码、用完即销；
+  `luajit_module` install/list_remote（远程库、缓存、离线复用）；linux_arm64 启用；
+  resolve 失败 `last_error` 可操作提示
 - **v0.30**: `_duckdb_query` 结果桥整数列按真实物理宽度读（INTEGER/SMALLINT/TINYINT/无符号族——此前全按 int64 读，非 BIGINT 列读出垃圾值，如 5 → 2147483648005）；存储过程式回查配方安全
 - **v0.29**: `luajit_table` 表函数参数——list（路径列表，替代 io.popen 兜底）+ mode='blob'（BLOB 返回列，NUL 安全）；generator 写入改长度感知
 - **v0.28**: BLOB 桥——`luajit_blob` 标量函数（Lua 字符串 ↔ BLOB，NUL 安全）+ BLOB 参数支持（fjs 长度感知写入）
