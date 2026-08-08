@@ -507,7 +507,8 @@ static void record_resolve_error(const char *name, const char *detail) {
     LUA_UNLOCK();
 }
 
-static int resolve_udf_chunk(lua_State *L, duckdb_vector nv) {
+static int resolve_udf_chunk(lua_State *L, duckdb_vector nv, bool *is_anon) {
+    if (is_anon) *is_anon = false;
     duckdb_string_t ns=((duckdb_string_t*)duckdb_vector_get_data(nv))[0];
     if(!duckdb_validity_row_is_valid(duckdb_vector_get_validity(nv),0)) return LUA_NOREF;
     const char *name = lj_string_data(&ns);
@@ -559,12 +560,14 @@ static int resolve_udf_chunk(lua_State *L, duckdb_vector nv) {
     snprintf(wrapped, sizeof(wrapped), "return function(x) %s end", name);
     if (luaL_loadstring(L, wrapped) == LUA_OK && lua_pcall(L, 0, 1, 0) == LUA_OK &&
         lua_isfunction(L, -1)) {
+        if (is_anon) *is_anon = true;
         return luaL_ref(L, LUA_REGISTRYINDEX);
     }
     lua_pop(L, lua_gettop(L));
     snprintf(wrapped, sizeof(wrapped), "return %s", name);
     if (luaL_loadstring(L, wrapped) == LUA_OK && lua_pcall(L, 0, 1, 0) == LUA_OK &&
         lua_isfunction(L, -1)) {
+        if (is_anon) *is_anon = true;
         return luaL_ref(L, LUA_REGISTRYINDEX);
     }
     lua_pop(L, lua_gettop(L));
@@ -624,7 +627,7 @@ static void fji(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     idx_t nr=duckdb_data_chunk_get_size(in),nc=duckdb_data_chunk_get_column_count(in);
     int64_t*od=(int64_t*)duckdb_vector_get_data(out);
     int udf_ref=LUA_NOREF;
-    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0));
+    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0),NULL);
     if(udf_ref==LUA_NOREF){invalidate_all(out,nr);goto lua_cleanup;}
     for(idx_t r=0;r<nr;r++){
         lua_rawgeti(L,LUA_REGISTRYINDEX,udf_ref);
@@ -645,7 +648,7 @@ static void fjf(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     idx_t nr=duckdb_data_chunk_get_size(in),nc=duckdb_data_chunk_get_column_count(in);
     double*od=(double*)duckdb_vector_get_data(out);
     int udf_ref=LUA_NOREF;
-    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0));
+    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0),NULL);
     if(udf_ref==LUA_NOREF){invalidate_all(out,nr);goto lua_cleanup;}
     for(idx_t r=0;r<nr;r++){
         lua_rawgeti(L,LUA_REGISTRYINDEX,udf_ref);
@@ -669,9 +672,26 @@ static void fjv(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
 
     double *od = (double *)duckdb_vector_get_data(out);
 
-    /* Resolve UDF name (from first row's column 0) */
-    int udf_ref = resolve_udf_chunk(L, duckdb_data_chunk_get_vector(in, 0));
+    /* Resolve UDF name (from first row's column 0). Anonymous source
+     * (v0.31 fallback) wraps to a scalar-style function — for batch
+     * executors that means per-row calls, not {table} args. */
+    bool is_anon = false;
+    int udf_ref = resolve_udf_chunk(L, duckdb_data_chunk_get_vector(in, 0), &is_anon);
     if (udf_ref == LUA_NOREF) { invalidate_all(out, nr); goto lua_cleanup; }
+    if (is_anon) {
+        /* Anonymous source: scalar-per-row semantics (like luajit_f). */
+        for (idx_t r = 0; r < nr; r++) {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, udf_ref);
+            for (idx_t c = 1; c < (idx_t)nc; c++)
+                push_flt(L, duckdb_data_chunk_get_vector(in, c), r);
+            if (!call_udf(fi, L, (int)(nc - 1), 1)) { invalidate_from(out, r, nr); break; }
+            if (lua_isnil(L, -1) || !lua_isnumber(L, -1)) mark_invalid(out, r);
+            else od[r] = lua_tonumber(L, -1);
+            lua_pop(L, 1);
+        }
+        luaL_unref(L, LUA_REGISTRYINDEX, udf_ref);
+        goto lua_cleanup;
+    }
 
     /* Build one Lua table per arg column: {val_1, val_2, ..., val_nr} */
     int nargs = (int)(nc - 1);
@@ -714,8 +734,23 @@ static void fjvi(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector ou
 
     int64_t *od = (int64_t *)duckdb_vector_get_data(out);
 
-    int udf_ref = resolve_udf_chunk(L, duckdb_data_chunk_get_vector(in, 0));
+    /* Anonymous source → scalar-per-row semantics (like luajit_i). */
+    bool is_anon = false;
+    int udf_ref = resolve_udf_chunk(L, duckdb_data_chunk_get_vector(in, 0), &is_anon);
     if (udf_ref == LUA_NOREF) { invalidate_all(out, nr); goto lua_cleanup; }
+    if (is_anon) {
+        for (idx_t r = 0; r < nr; r++) {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, udf_ref);
+            for (idx_t c = 1; c < (idx_t)nc; c++)
+                push_int(L, duckdb_data_chunk_get_vector(in, c), r);
+            if (!call_udf(fi, L, (int)(nc - 1), 1)) { invalidate_from(out, r, nr); break; }
+            if (lua_isnil(L, -1) || !lua_isnumber(L, -1)) mark_invalid(out, r);
+            else od[r] = (int64_t)lua_tointeger(L, -1);
+            lua_pop(L, 1);
+        }
+        luaL_unref(L, LUA_REGISTRYINDEX, udf_ref);
+        goto lua_cleanup;
+    }
 
     int nargs = (int)(nc - 1);
     lua_rawgeti(L, LUA_REGISTRYINDEX, udf_ref);
@@ -753,8 +788,23 @@ static void fjvs(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector ou
     idx_t nc = duckdb_data_chunk_get_column_count(in);
     if (nr == 0 || nc < 2) goto lua_cleanup;
 
-    int udf_ref = resolve_udf_chunk(L, duckdb_data_chunk_get_vector(in, 0));
+    /* Anonymous source → scalar-per-row semantics (like luajit_s). */
+    bool is_anon = false;
+    int udf_ref = resolve_udf_chunk(L, duckdb_data_chunk_get_vector(in, 0), &is_anon);
     if (udf_ref == LUA_NOREF) { invalidate_all(out, nr); goto lua_cleanup; }
+    if (is_anon) {
+        for (idx_t r = 0; r < nr; r++) {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, udf_ref);
+            for (idx_t c = 1; c < (idx_t)nc; c++)
+                push_str(L, duckdb_data_chunk_get_vector(in, c), r);
+            if (!call_udf(fi, L, (int)(nc - 1), 1)) { invalidate_from(out, r, nr); break; }
+            if (lua_isnil(L, -1)) mark_invalid(out, r);
+            else duckdb_vector_assign_string_element(out, r, lua_tostring(L, -1));
+            lua_pop(L, 1);
+        }
+        luaL_unref(L, LUA_REGISTRYINDEX, udf_ref);
+        goto lua_cleanup;
+    }
 
     int nargs = (int)(nc - 1);
     lua_rawgeti(L, LUA_REGISTRYINDEX, udf_ref);
@@ -795,7 +845,7 @@ static void fjb(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     idx_t nr=duckdb_data_chunk_get_size(in),nc=duckdb_data_chunk_get_column_count(in);
     bool*od=(bool*)duckdb_vector_get_data(out);
     int udf_ref=LUA_NOREF;
-    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0));
+    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0),NULL);
     if(udf_ref==LUA_NOREF){invalidate_all(out,nr);goto lua_cleanup;}
     for(idx_t r=0;r<nr;r++){
         lua_rawgeti(L,LUA_REGISTRYINDEX,udf_ref);
@@ -817,7 +867,7 @@ static void fjm(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     idx_t nr=duckdb_data_chunk_get_size(in),nc=duckdb_data_chunk_get_column_count(in);
     double*od=(double*)duckdb_vector_get_data(out);
     int udf_ref=LUA_NOREF;
-    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0));
+    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0),NULL);
     if(udf_ref==LUA_NOREF){invalidate_all(out,nr);goto lua_cleanup;}
     for(idx_t r=0;r<nr;r++){
         lua_rawgeti(L,LUA_REGISTRYINDEX,udf_ref);
@@ -958,7 +1008,7 @@ static void fjl(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     idx_t nr = duckdb_data_chunk_get_size(in), nc = duckdb_data_chunk_get_column_count(in);
     duckdb_vector oc = duckdb_list_vector_get_child(out);
     int udf_ref=LUA_NOREF;
-    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0));
+    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0),NULL);
     if(udf_ref==LUA_NOREF){
         invalidate_all(out,nr);
         for(idx_t i=0;i<nr;i++) zero_list_entry(out,i);
@@ -1132,7 +1182,7 @@ static void fjs(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
     LUA_BEGIN();
     idx_t nr = duckdb_data_chunk_get_size(in);
     int udf_ref=LUA_NOREF;
-    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0));
+    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0),NULL);
     if(udf_ref==LUA_NOREF){invalidate_all(out,nr);goto lua_cleanup;}
     for (idx_t r = 0; r < nr; r++) {
         lua_rawgeti(L,LUA_REGISTRYINDEX,udf_ref);
@@ -1188,7 +1238,7 @@ static void fjm_map(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector
     LUA_BEGIN();
     idx_t nr = duckdb_data_chunk_get_size(in);
     int udf_ref=LUA_NOREF;
-    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0));
+    if(nr>0)udf_ref=resolve_udf_chunk(L,duckdb_data_chunk_get_vector(in,0),NULL);
     if(udf_ref==LUA_NOREF){invalidate_all(out,nr);goto lua_cleanup;}
     for (idx_t r = 0; r < nr; r++) {
         lua_rawgeti(L,LUA_REGISTRYINDEX,udf_ref);
@@ -1868,15 +1918,22 @@ static int cache_write_file(const char *path, const char *content) {
     return 1;
 }
 
-/* Resolve a lib name to source: local cache → INDEX → fetch. Caller frees. */
-static char *lib_fetch_source(bind_t *d, const char *name, char **err_out) {
+/* User home dir for the lib cache (~/.duckdb/luajit-libs). Windows uses
+ * USERPROFILE (HOME may be unset); fall back to "." so cache lookups stay
+ * local instead of crashing on a NULL path. */
+static const char *lib_cache_home(void) {
     const char *home = getenv("HOME");
 #ifdef _MSC_VER
     if (!home) home = getenv("USERPROFILE");
 #endif
     if (!home) home = ".";
+    return home;
+}
+
+/* Resolve a lib name to source: local cache → INDEX → fetch. Caller frees. */
+static char *lib_fetch_source(bind_t *d, const char *name, char **err_out) {
     char cache_file[2048];
-    snprintf(cache_file, sizeof(cache_file), "%s/.duckdb/luajit-libs/%s.lua", home, name);
+    snprintf(cache_file, sizeof(cache_file), "%s/.duckdb/luajit-libs/%s.lua", lib_cache_home(), name);
 
     /* 1. local cache */
     FILE *fp = fopen(cache_file, "r");
@@ -1941,13 +1998,8 @@ static char *lib_fetch_source(bind_t *d, const char *name, char **err_out) {
 /* Fetch the libs INDEX (name|path lines) with a local cache, so list_remote
  * works offline after the first call. Caller frees. */
 static char *lib_fetch_index(char **err_out) {
-    const char *home = getenv("HOME");
-#ifdef _MSC_VER
-    if (!home) home = getenv("USERPROFILE");
-#endif
-    if (!home) home = ".";
     char cache_file[2048];
-    snprintf(cache_file, sizeof(cache_file), "%s/.duckdb/luajit-libs/INDEX", home);
+    snprintf(cache_file, sizeof(cache_file), "%s/.duckdb/luajit-libs/INDEX", lib_cache_home());
 
     FILE *fp = fopen(cache_file, "r");
     if (fp) {
@@ -2332,8 +2384,10 @@ static void mod_init_locked(duckdb_init_info info) {
         udf_registry_set(name, src);
         d->ok=true;d->phase="install";d->sql_name=strdup(name);
         char b[2048];
-        snprintf(b,sizeof(b),"installed '%s' (%s) — cached at ~/.duckdb/luajit-libs/%s.lua",name,
-            isfn?"UDF":"module table",name);
+        /* Report the REAL cache path (HOME on POSIX, USERPROFILE on Windows)
+         * instead of a hard-coded ~/ — the user may dofile() it. */
+        snprintf(b,sizeof(b),"installed '%s' (%s) — cached at %s/.duckdb/luajit-libs/%s.lua",name,
+            isfn?"UDF":"module table",lib_cache_home(),name);
         d->msg=strdup(b);
         if(isfn)
             snprintf(b,sizeof(b),"luajit_table('%s') or luajit_s('%s', ...)",name,name);
