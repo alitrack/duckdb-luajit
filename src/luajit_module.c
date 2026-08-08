@@ -1204,6 +1204,9 @@ static void fjm_map(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector
 
 /* ── Aggregate UDF: luajit_agg(name, arg) → DOUBLE ── */
 
+/* Per-database UDF registry (defined below load_udfs_from_file). */
+static void udf_registry_set(const char *name, const char *source);
+
 /* Shared load-from-file helper (used by both mode='load' and auto-load) */
 static int load_udfs_from_file(const char *path) {
     FILE *fp = fopen(path, "r");
@@ -1240,11 +1243,168 @@ static int load_udfs_from_file(const char *path) {
         lua_setglobal(L, name);
         /* P4: register in shared table so other threads can lazy-compile */
         udf_source_set(name, source);
+        /* Mirror into the per-database registry so a file load is also
+         * persisted (mode='load' → survives restarts like compile does). */
+        udf_registry_set(name, source);
         loaded++;
     }
     fclose(fp);
     LUA_UNLOCK();
     return loaded;
+}
+
+/* ── Per-database UDF registry ──
+ * install/compile/quick_compile/fennel register UDFs into the *current*
+ * Lua state, which dies with the process. To survive restarts, every
+ * registration is mirrored into a `luajit_udf_registry` table *in the
+ * current database file* (name → source). On extension load we read that
+ * table back and re-register — so opening the SAME .db file again brings
+ * the UDFs back automatically, while a different database file does NOT
+ * inherit another database's UDFs (each db has its own registry).
+ *
+ * The cache dir (~/.duckdb/luajit-libs/) stays as a *source* cache for
+ * offline install, but it is NOT scanned at load: UDF persistence is
+ * scoped to the database file, not to the user home dir.
+ *
+ * All SQL runs on g_conn (the extension's private connection to the db it
+ * was loaded from) under LUA_LOCK. Read-only databases: CREATE TABLE /
+ * INSERT fail → we silently skip persistence (UDFs still work for the
+ * session, they just don't survive). Errors never abort the UDF path.
+ */
+#define UDF_REGISTRY_TABLE "luajit_udf_registry"
+
+/* Ensure the registry table exists. Returns true if usable. */
+static bool udf_registry_ensure(void) {
+    if (!g_conn) return false;
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "CREATE TABLE IF NOT EXISTS %s (name VARCHAR PRIMARY KEY, source VARCHAR)",
+             UDF_REGISTRY_TABLE);
+    duckdb_result rres;
+    LUA_LOCK();
+    duckdb_state st = duckdb_query(g_conn, sql, &rres);
+    if (st == DuckDBSuccess) duckdb_destroy_result(&rres);
+    LUA_UNLOCK();
+    return st == DuckDBSuccess;
+}
+
+/* Mirror one UDF into the registry (INSERT OR REPLACE on name). */
+static void udf_registry_set(const char *name, const char *source) {
+    if (!g_conn || !name || !source) return;
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "INSERT OR REPLACE INTO %s (name, source) VALUES (?, ?)",
+             UDF_REGISTRY_TABLE);
+    duckdb_prepared_statement stmt = NULL;
+    LUA_LOCK();
+    if (duckdb_prepare(g_conn, sql, &stmt) != DuckDBSuccess) {
+        if (stmt) duckdb_destroy_prepare(&stmt);
+        LUA_UNLOCK();
+        return;
+    }
+    duckdb_bind_varchar(stmt, 1, name);
+    duckdb_bind_varchar(stmt, 2, source);
+    duckdb_result rres;
+    if (duckdb_execute_prepared(stmt, &rres) == DuckDBSuccess)
+        duckdb_destroy_result(&rres);
+    duckdb_destroy_prepare(&stmt);
+    LUA_UNLOCK();
+}
+
+/* Remove one UDF from the registry. */
+static void udf_registry_del(const char *name) {
+    if (!g_conn || !name) return;
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "DELETE FROM %s WHERE name = ?", UDF_REGISTRY_TABLE);
+    duckdb_prepared_statement stmt = NULL;
+    LUA_LOCK();
+    if (duckdb_prepare(g_conn, sql, &stmt) != DuckDBSuccess) {
+        if (stmt) duckdb_destroy_prepare(&stmt);
+        LUA_UNLOCK();
+        return;
+    }
+    duckdb_bind_varchar(stmt, 1, name);
+    duckdb_result rres;
+    if (duckdb_execute_prepared(stmt, &rres) == DuckDBSuccess)
+        duckdb_destroy_result(&rres);
+    duckdb_destroy_prepare(&stmt);
+    LUA_UNLOCK();
+}
+
+/* Clear the whole registry (reset mode). */
+static void udf_registry_clear(void) {
+    if (!g_conn) return;
+    char sql[512];
+    snprintf(sql, sizeof(sql), "DELETE FROM %s", UDF_REGISTRY_TABLE);
+    duckdb_result rres;
+    LUA_LOCK();
+    duckdb_state st = duckdb_query(g_conn, sql, &rres);
+    if (st == DuckDBSuccess) duckdb_destroy_result(&rres);
+    LUA_UNLOCK();
+}
+
+/* Re-register every UDF from the current database's registry. Same
+ * semantics as install: lib returning function → UDF (setglobal +
+ * udf_source_set so other threads lazy-compile); returning table → global
+ * module. Entries that fail to compile are skipped (a stale/broken cache
+ * must not brick the extension). */
+static int udf_registry_restore(void) {
+    if (!g_conn) return 0;
+    char sql[512];
+    snprintf(sql, sizeof(sql), "SELECT name, source FROM %s", UDF_REGISTRY_TABLE);
+    duckdb_result rres;
+    LUA_LOCK();
+    duckdb_state st = duckdb_query(g_conn, sql, &rres);
+    if (st != DuckDBSuccess) {
+        duckdb_destroy_result(&rres);
+        LUA_UNLOCK();
+        return 0;
+    }
+
+    L_(); lua_State *L = g_lua;
+    if (!L) { duckdb_destroy_result(&rres); LUA_UNLOCK(); return 0; }
+
+    int n = 0;
+    duckdb_data_chunk chunk;
+    while ((chunk = duckdb_fetch_chunk(rres)) != NULL) {
+        idx_t nrows = duckdb_data_chunk_get_size(chunk);
+        duckdb_vector nv = duckdb_data_chunk_get_vector(chunk, 0);
+        duckdb_vector sv = duckdb_data_chunk_get_vector(chunk, 1);
+        duckdb_string_t *names = (duckdb_string_t *)duckdb_vector_get_data(nv);
+        duckdb_string_t *srcs  = (duckdb_string_t *)duckdb_vector_get_data(sv);
+        for (idx_t r = 0; r < nrows; r++) {
+            /* validity bitmap: NULL name/source rows are skipped */
+            if (duckdb_validity_row_is_valid(duckdb_vector_get_validity(nv), r) &&
+                duckdb_validity_row_is_valid(duckdb_vector_get_validity(sv), r)) {
+                uint32_t nl = duckdb_string_t_length(names[r]);
+                uint32_t sl = duckdb_string_t_length(srcs[r]);
+                char *name = (char *)malloc((size_t)nl + 1);
+                char *src  = (char *)malloc((size_t)sl + 1);
+                memcpy(name, duckdb_string_t_data(&names[r]), nl); name[nl] = 0;
+                memcpy(src,  duckdb_string_t_data(&srcs[r]),  sl); src[sl]  = 0;
+                if (luaL_loadstring(L, src) == LUA_OK && lua_pcall(L, 0, 1, 0) == LUA_OK) {
+                    int isfn = lua_isfunction(L, -1);
+                    int istbl = lua_istable(L, -1);
+                    if (isfn || istbl) {
+                        lua_setglobal(L, name); /* pops the value */
+                        if (isfn) udf_source_set(name, src);
+                        n++;
+                    } else {
+                        lua_pop(L, 1); /* value is neither — drop it */
+                    }
+                } else {
+                    lua_pop(L, 1); /* skip broken entry */
+                }
+                free(name);
+                free(src);
+            }
+        }
+        duckdb_destroy_data_chunk(&chunk);
+    }
+    duckdb_destroy_result(&rres);
+    LUA_UNLOCK();
+    return n;
 }
 
 /* Per-state aggregate: values live inside DuckDB's aggregate state (a
@@ -1911,6 +2071,9 @@ static void mod_init_locked(duckdb_init_info info) {
         bool removed = udf_source_del(d->sql_name);
         LUA_UNLOCK();
         L_();if(g_lua){lua_pushnil(g_lua);lua_setglobal(g_lua,d->sql_name);}
+        /* Also remove from the per-database registry, else the UDF comes
+         * back on the next connection to this db file (zombie UDF). */
+        udf_registry_del(d->sql_name);
         d->ok=removed;d->phase="drop";d->sql_name=strdup(d->sql_name);
         if(!removed)d->msg=strdup("UDF not found");
         return;
@@ -1924,6 +2087,8 @@ static void mod_init_locked(duckdb_init_info info) {
         LUA_UNLOCK();
         if(g_lua){lua_close(g_lua);g_lua=NULL;}
         L_();
+        /* Clear the per-database registry too — reset means "gone for good". */
+        udf_registry_clear();
         d->ok=true;d->phase="reset";d->msg=strdup("UDFs reset");
         return;
     }
@@ -2113,6 +2278,11 @@ static void mod_init_locked(duckdb_init_info info) {
         }
 
         d->ok=true;d->sql_name=strdup(d->sql_name);d->detail=strdup(buf);
+        /* The CREATE OR REPLACE MACRO above is a catalog object that
+         * persists with the db file — so the Lua UDF source must persist
+         * too, else after restart the macro exists but luajit_s returns
+         * NULL. Mirror source into the per-database registry. */
+        udf_registry_set(d->sql_name, d->source);
         return;
     }
 
@@ -2157,6 +2327,9 @@ static void mod_init_locked(duckdb_init_info info) {
             /* module table (e.g. json): register as global for dofile-style use */
             lua_setglobal(L,name);
         }
+        /* Mirror into the per-database registry (both UDF and module-table
+         * forms) so the lib survives restarts on this db file. */
+        udf_registry_set(name, src);
         d->ok=true;d->phase="install";d->sql_name=strdup(name);
         char b[2048];
         snprintf(b,sizeof(b),"installed '%s' (%s) — cached at ~/.duckdb/luajit-libs/%s.lua",name,
@@ -2290,6 +2463,9 @@ static void mod_init_locked(duckdb_init_info info) {
         /* Store the COMPILED Lua source (other threads lazy-compile it;
          * save/load round-trips the compiled form) */
         udf_source_set(d->sql_name, compiled);
+        /* Mirror the compiled form into the per-database registry so the
+         * Fennel UDF survives restarts on this db file. */
+        udf_registry_set(d->sql_name, compiled);
         d->ok=true;d->sql_name=strdup(d->sql_name);
         d->detail=strdup(compiled);
         return;
@@ -2314,6 +2490,9 @@ static void mod_init_locked(duckdb_init_info info) {
     lua_getglobal(L,"_UDF_SOURCES");
     if(!lua_istable(L,-1)){lua_pop(L,1);lua_newtable(L);lua_setglobal(L,"_UDF_SOURCES");lua_getglobal(L,"_UDF_SOURCES");}
     lua_pushstring(L,d->source);lua_setfield(L,-2,d->sql_name);lua_pop(L,1);
+    /* Mirror into the per-database registry so compile survives restarts
+     * on this db file (same persistence as install). */
+    udf_registry_set(d->sql_name, d->source);
     d->ok=true;d->sql_name=strdup(d->sql_name);
 }
 
@@ -2469,7 +2648,13 @@ void luajit_register_module_functions(
     duckdb_register_table_function(conn,t);
     duckdb_destroy_table_function(&t);
 
-    /* Auto-load UDFs from default file on extension init */
+    /* Restore UDFs persisted in THIS database file's registry (install /
+     * compile / quick_compile / fennel / load all mirror into it). A
+     * different .db file has its own registry — opening another database
+     * does NOT pull in this one's UDFs. Then apply the explicit
+     * save/load file workflow on top (default file, if present). */
+    udf_registry_ensure();
+    udf_registry_restore();
     load_udfs_from_file("luajit_udfs.txt");
 }
 
