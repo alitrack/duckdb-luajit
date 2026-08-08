@@ -496,10 +496,11 @@ static void fj(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out)
 
 /* Record a resolve failure into g_last_error (LUA_LOCK-protected). */
 static void record_resolve_error(const char *name, const char *detail) {
-    char buf[720];
+    char buf[2560];
     snprintf(buf, sizeof(buf),
              "UDF '%s' %s — use one of: luajit_module(mode:='compile'|'install', sql_name:='%s', ...), "
-             "or pass anonymous function source: luajit_i('function(x) return ... end', arg)",
+             "or pass anonymous function source: luajit_i('function(x) return ... end', arg) "
+             "(luajit_s/vi/v/vs accept the same anonymous form)",
              name, detail, name);
     LUA_LOCK();
     free(g_last_error);
@@ -1407,7 +1408,6 @@ static int udf_registry_restore(void) {
     LUA_LOCK();
     duckdb_state st = duckdb_query(g_conn, sql, &rres);
     if (st != DuckDBSuccess) {
-        duckdb_destroy_result(&rres);
         LUA_UNLOCK();
         return 0;
     }
@@ -1930,10 +1930,23 @@ static const char *lib_cache_home(void) {
     return home;
 }
 
+/* Write the lib cache file path for FILE (e.g. "foo.lua" or "INDEX") into
+ * buf. Always uses FORWARD slashes: fopen accepts '/' on Windows, and the
+ * path is shown to users for dofile() — backslashes in a Lua string
+ * literal are escape sequences ('C:\Users\lt' is an invalid escape, only
+ * [[C:\Users\lt]] or forward slashes work). */
+static void lib_cache_path(char *buf, size_t bufsz, const char *file) {
+    snprintf(buf, bufsz, "%s/.duckdb/luajit-libs/%s", lib_cache_home(), file);
+    for (char *p = buf; *p; p++)
+        if (*p == '\\') *p = '/';
+}
+
 /* Resolve a lib name to source: local cache → INDEX → fetch. Caller frees. */
 static char *lib_fetch_source(bind_t *d, const char *name, char **err_out) {
     char cache_file[2048];
-    snprintf(cache_file, sizeof(cache_file), "%s/.duckdb/luajit-libs/%s.lua", lib_cache_home(), name);
+    char cache_name[512];
+    snprintf(cache_name, sizeof(cache_name), "%s.lua", name);
+    lib_cache_path(cache_file, sizeof(cache_file), cache_name);
 
     /* 1. local cache */
     FILE *fp = fopen(cache_file, "r");
@@ -1999,7 +2012,7 @@ static char *lib_fetch_source(bind_t *d, const char *name, char **err_out) {
  * works offline after the first call. Caller frees. */
 static char *lib_fetch_index(char **err_out) {
     char cache_file[2048];
-    snprintf(cache_file, sizeof(cache_file), "%s/.duckdb/luajit-libs/INDEX", lib_cache_home());
+    lib_cache_path(cache_file, sizeof(cache_file), "INDEX");
 
     FILE *fp = fopen(cache_file, "r");
     if (fp) {
@@ -2383,11 +2396,16 @@ static void mod_init_locked(duckdb_init_info info) {
          * forms) so the lib survives restarts on this db file. */
         udf_registry_set(name, src);
         d->ok=true;d->phase="install";d->sql_name=strdup(name);
-        char b[2048];
         /* Report the REAL cache path (HOME on POSIX, USERPROFILE on Windows)
-         * instead of a hard-coded ~/ — the user may dofile() it. */
-        snprintf(b,sizeof(b),"installed '%s' (%s) — cached at %s/.duckdb/luajit-libs/%s.lua",name,
-            isfn?"UDF":"module table",lib_cache_home(),name);
+         * instead of a hard-coded ~/ — the user may dofile() it. Forward
+         * slashes only: Lua string literals choke on backslash escapes. */
+        char cache_path[2048];
+        char cache_name[512];
+        snprintf(cache_name, sizeof(cache_name), "%s.lua", name);
+        lib_cache_path(cache_path, sizeof(cache_path), cache_name);
+        char b[4096];
+        snprintf(b,sizeof(b),"installed '%s' (%s) — cached at %s",name,
+            isfn?"UDF":"module table",cache_path);
         d->msg=strdup(b);
         if(isfn)
             snprintf(b,sizeof(b),"luajit_table('%s') or luajit_s('%s', ...)",name,name);
