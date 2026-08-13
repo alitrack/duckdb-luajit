@@ -524,6 +524,17 @@ static int resolve_udf_chunk(lua_State *L, duckdb_vector nv, bool *is_anon) {
     name = nbuf;
     lua_getglobal(L,name);
     if(lua_isfunction(L,-1)) return luaL_ref(L,LUA_REGISTRYINDEX);
+    /* Module-table libs (install of etl, udf, ...): the global is a table
+     * with a .run method (e.g. install 'incremental' → incremental.run(opts)).
+     * Resolve to run so luajit_s('incremental', opts) calls the lib directly. */
+    if (lua_istable(L, -1)) {
+        lua_getfield(L, -1, "run");
+        if (lua_isfunction(L, -1)) {
+            lua_remove(L, -2);  /* drop the table, keep the run function */
+            return luaL_ref(L, LUA_REGISTRYINDEX);
+        }
+        lua_pop(L, 1);
+    }
     bool existed = !lua_isnil(L, -1);   /* registered under this name but not a function */
     lua_pop(L,1);
     /* P4: UDF may have been compiled on another thread's state — lazily
