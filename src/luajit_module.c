@@ -1722,38 +1722,64 @@ static void tbt_init(duckdb_init_info info) {
     if (d && d->source) {
         L_(); lua_State *L = g_lua;
         if (!L) { LUA_UNLOCK(); return; }
-        /* Try compiled UDF first, then inline source */
+        /* 3-tier name resolution. g_lua is TLS (per-thread): quick_compile /
+         * install register the lib as a Lua global in ONE thread's state, but
+         * tbt_init may run on a DIFFERENT worker thread whose state lacks the
+         * global. Previously only lua_getglobal was tried, so on another
+         * thread isfunc=0 and the fallback mis-compiled the NAME as inline
+         * source (a bare identifier → nil → not a table → silent 0 rows) —
+         * the flaky parallel 0-rows bug (repro: DEFAULT threads [3,3,3,0,...],
+         * threads=1 stable). Now: (1) local global, (2) the shared C source
+         * table (udf_source_set by quick_compile/install), (3) inline source.
+         * Same lazy-compile-from-shared-table pattern as agg_finalize. */
         lua_getglobal(L, d->source);
-        if (!lua_isfunction(L, -1)) {
+        if (lua_isfunction(L, -1)) {
+            /* tier 1: the lib is a global in this thread's state */
+        } else {
             lua_pop(L, 1);
-            /* Compile inline source → function on stack */
-            if (luaL_loadstring(L, d->source) != LUA_OK) {
-                /* Debuggability: surface Lua syntax errors instead of silent 0 rows */
-                char ebuf[640];
-                snprintf(ebuf, sizeof(ebuf), "luajit_table source compile: %s",
-                         lua_tostring(L, -1) ? lua_tostring(L, -1) : "unknown");
-                lua_pop(L, 1);
-                LUA_LOCK();
-                free(g_last_error);
-                g_last_error = strdup(ebuf);
-                LUA_UNLOCK();
-                LUA_UNLOCK();
-                return;
-            }
-            if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
-                char ebuf[640];
-                snprintf(ebuf, sizeof(ebuf), "luajit_table source exec: %s",
-                         lua_tostring(L, -1) ? lua_tostring(L, -1) : "unknown");
-                lua_pop(L, 1);
-                LUA_LOCK();
-                free(g_last_error);
-                g_last_error = strdup(ebuf);
-                LUA_UNLOCK();
-                LUA_UNLOCK();
-                return;
+            char *shared_src = udf_source_get(d->source);  /* needs LUA_LOCK (held) */
+            if (shared_src) {
+                /* tier 2: registered on another thread's state — recompile the
+                 * stored source in this state (e.g. 'return dofile(...)'). */
+                if (luaL_loadstring(L, shared_src) != LUA_OK) {
+                    free(shared_src);
+                    char ebuf[640];
+                    snprintf(ebuf, sizeof(ebuf), "luajit_table source compile: %s",
+                             lua_tostring(L, -1) ? lua_tostring(L, -1) : "unknown");
+                    lua_pop(L, 1);
+                    free(g_last_error); g_last_error = strdup(ebuf);
+                    LUA_UNLOCK(); return;
+                }
+                free(shared_src);
+                if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
+                    char ebuf[640];
+                    snprintf(ebuf, sizeof(ebuf), "luajit_table source exec: %s",
+                             lua_tostring(L, -1) ? lua_tostring(L, -1) : "unknown");
+                    lua_pop(L, 1);
+                    free(g_last_error); g_last_error = strdup(ebuf);
+                    LUA_UNLOCK(); return;
+                }
+            } else {
+                /* tier 3: d->source is inline source code (not a name) */
+                if (luaL_loadstring(L, d->source) != LUA_OK) {
+                    char ebuf[640];
+                    snprintf(ebuf, sizeof(ebuf), "luajit_table source compile: %s",
+                             lua_tostring(L, -1) ? lua_tostring(L, -1) : "unknown");
+                    lua_pop(L, 1);
+                    free(g_last_error); g_last_error = strdup(ebuf);
+                    LUA_UNLOCK(); return;
+                }
+                if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
+                    char ebuf[640];
+                    snprintf(ebuf, sizeof(ebuf), "luajit_table source exec: %s",
+                             lua_tostring(L, -1) ? lua_tostring(L, -1) : "unknown");
+                    lua_pop(L, 1);
+                    free(g_last_error); g_last_error = strdup(ebuf);
+                    LUA_UNLOCK(); return;
+                }
             }
         }
-        /* Result dispatch (executed source is on the stack):
+        /* Result dispatch (resolved function is on the stack):
          *  - C function (coroutine.wrap iterator) → streaming generator mode
          *    (must check BEFORE calling — pcall on the iterator would consume
          *    the first yield and the generator would never be registered)
