@@ -944,6 +944,12 @@ static void fjm(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out
 
 typedef struct { uint64_t offset; uint64_t length; } list_entry_t;
 
+/* forward decls: struct bridge (defined below) is needed for LIST-of-STRUCT /
+ * LIST-of-LIST element push — C requires declaration before use. */
+static void push_struct_to_lua(lua_State *L, duckdb_vector sv, idx_t r);
+static void push_list_to_lua(lua_State *L, duckdb_vector list_vec, duckdb_vector child_vec, idx_t r);
+static void write_lua_to_struct(lua_State *L, duckdb_vector out, idx_t row);
+
 static void push_list_to_lua(lua_State *L, duckdb_vector list_vec, duckdb_vector child_vec, idx_t r) {
     list_entry_t *entries = (list_entry_t *)duckdb_vector_get_data(list_vec);
     uint64_t off = entries[r].offset, len = entries[r].length;
@@ -1000,6 +1006,14 @@ static void push_list_to_lua(lua_State *L, duckdb_vector list_vec, duckdb_vector
         } else if (ct == DUCKDB_TYPE_VARCHAR) {
             duckdb_string_t s = ((duckdb_string_t *)duckdb_vector_get_data(child_vec))[p];
             lua_pushlstring(L, lj_string_data(&s), duckdb_string_t_length(s));
+        } else if (ct == DUCKDB_TYPE_STRUCT) {
+            /* LIST-of-STRUCT: element → Lua table with named keys. Missing
+             * branch was the "records = {nil,nil,nil}" bug: LIST-of-STRUCT
+             * params arrived in Lua as all-nil. */
+            push_struct_to_lua(L, child_vec, p);
+        } else if (ct == DUCKDB_TYPE_LIST) {
+            /* nested LIST (LIST-of-LIST) — recurse through the same bridge */
+            push_list_to_lua(L, child_vec, duckdb_list_vector_get_child(child_vec), p);
         } else {
             lua_pushnil(L);
         }
@@ -1030,6 +1044,10 @@ static void write_lua_to_list(lua_State *L, duckdb_vector out, duckdb_vector chi
             ((bool *)duckdb_vector_get_data(child))[p] = lua_toboolean(L, -1);
         else if (ct == DUCKDB_TYPE_VARCHAR)
             duckdb_vector_assign_string_element(child, p, lua_isstring(L, -1) ? lua_tostring(L, -1) : "");
+        else if (ct == DUCKDB_TYPE_STRUCT)
+            /* Lua table element → STRUCT child at row p (element on stack top,
+             * matching write_lua_to_struct's contract) */
+            write_lua_to_struct(L, child, p);
         lua_pop(L, 1);
     }
 }
