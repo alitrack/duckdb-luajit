@@ -176,6 +176,37 @@ SELECT luajit_agg('mysum', x) FROM (VALUES (1),(2),(3)) t(x)
 ----
 6
 
+# luajit_agg over window (partition): registered DuckDB aggregate auto-joins the
+# window operator — partition totals via Lua finalize per group
+statement ok
+CREATE TABLE aggwin AS SELECT i%3 AS g, i::BIGINT AS v FROM range(9) r(i)
+
+query II
+SELECT g, luajit_agg('mysum', v) OVER (PARTITION BY g) AS w FROM aggwin ORDER BY g, v
+----
+0	9
+0	9
+0	9
+1	12
+1	12
+1	12
+2	15
+2	15
+2	15
+
+# rolling frame (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) → cumulative
+query II
+SELECT v, luajit_agg('mysum', v) OVER (ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS run FROM range(5) r(v)
+----
+0	0
+1	1
+2	3
+3	6
+4	10
+
+statement ok
+DROP TABLE aggwin
+
 statement ok
 SELECT message FROM luajit_module(mode := 'quick_compile', sql_name := 'gen3',
   source := 'return function() return { {1, "a"}, {2, "b"}, {3, "c"} } end')
