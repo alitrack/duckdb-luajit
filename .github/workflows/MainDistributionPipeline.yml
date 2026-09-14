@@ -98,7 +98,14 @@ jobs:
                 extension_suffix=".duckdb_extension"
                 stem="${asset_name%.duckdb_extension}"
               fi
-              cp "$asset" "release-assets/${stem}-${platform_suffix}${extension_suffix}"
+              # Platform separator MUST be '.', not '-': DuckDB derives the C-ABI
+              # entrypoint as "<text before the FIRST dot>_init_c_api"
+              # (FileSystem::ExtractBaseName + extension_load.cpp).
+              # 'luajit-windows_amd64.duckdb_extension' would make the loader look
+              # for 'luajit-windows_amd64_init_c_api' (not exported) and fail with
+              # 'did not contain function'. 'luajit.windows_amd64.duckdb_extension'
+              # -> 'luajit_init_c_api' -> loads. See issue #1 (2026-09-14).
+              cp "$asset" "release-assets/${stem}.${platform_suffix}${extension_suffix}"
             done
           done
           test -n "$(find release-assets -type f | head -1)"
