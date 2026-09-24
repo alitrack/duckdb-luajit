@@ -98,6 +98,7 @@ static void TBT_L_(void) {
     }
 }
 static duckdb_connection g_conn = NULL;
+static duckdb_database g_conn_db = NULL;   /* db g_conn is bound to (P0-3) */
 /* Last Lua UDF runtime error — set/read under LUA_LOCK. We do NOT use
  * duckdb_function_set_error: on DuckDB 1.2.0 the CFunctionInfo error string
  * handed to us is in a corrupted state (crash inside std::string::assign).
@@ -420,12 +421,47 @@ static inline const char *lj_string_data(duckdb_string_t *s) {
 static void push_timestamp_micros(lua_State *L, int64_t micros);
 static void push_decimal_any(lua_State *L, duckdb_logical_type lt, void *data, idx_t r);
 
+/* ── P0-3: bridge reentrancy boundary (independent review 2026-09-24) ──
+ * The bridge runs on its own persistent connection (g_conn, created at
+ * registration) — NOT on the connection executing the UDF. Under DuckDB's
+ * MVCC that means:
+ *   ALLOWED  : UDF querying its own table → reads the last committed
+ *              snapshot (no self-read of in-flight rows, no deadlock)
+ *   ALLOWED  : concurrent UDFs calling the bridge → serialized on LUA_LOCK
+ *   BLOCKED  : reentrancy — a UDF executing INSIDE a bridge-issued query
+ *              calling back into the bridge. Nested duckdb_query() on the
+ *              same g_conn deadlocks on the connection lock (verified live:
+ *              pre-fix it hung forever). Guard: global busy flag, checked
+ *              BEFORE acquiring LUA_LOCK so the nested caller gets an
+ *              immediate hard error instead of blocking, double-checked
+ *              under the lock to close the check/lock race. */
+static volatile int g_bridge_busy = 0;   /* written under LUA_LOCK */
+
+static int bridge_enter(lua_State *L, const char *fn) {
+    if (g_bridge_busy) {   /* fast path: nested caller errors out, no block */
+        return luaL_error(L,
+            "%s reentrancy blocked — a UDF called from bridge SQL is calling back into SQL; "
+            "break the cycle (e.g. materialize the inner result first)", fn);
+    }
+    LUA_LOCK();
+    if (g_bridge_busy) {   /* double-check under the lock (race window) */
+        LUA_UNLOCK();
+        return luaL_error(L,
+            "%s reentrancy blocked — a UDF called from bridge SQL is calling back into SQL; "
+            "break the cycle (e.g. materialize the inner result first)", fn);
+    }
+    g_bridge_busy = 1;
+    return 0;   /* caller holds LUA_LOCK */
+}
+
 static int l_duckdb_call(lua_State *L) {
     if (!g_conn) { lua_pushstring(L, "no connection"); return 1; }
     const char *sql = luaL_checkstring(L, 1);
+    int e = bridge_enter(L, "_duckdb_call");
+    if (e) return e;
     duckdb_result res;
-    LUA_LOCK();  /* P4: g_conn is shared across threads */
     duckdb_state st = duckdb_query(g_conn, sql, &res);
+    g_bridge_busy = 0;
     LUA_UNLOCK();
     if (st != DuckDBSuccess) {
         lua_pushfstring(L, "error: %s", duckdb_result_error(&res));
@@ -444,9 +480,14 @@ static int l_duckdb_call(lua_State *L) {
 static int l_duckdb_query(lua_State *L) {
     const char *sql = luaL_checkstring(L, 1);
     if (!g_conn) { lua_pushnil(L); lua_pushstring(L, "no connection"); return 2; }
+    int e = bridge_enter(L, "_duckdb_query");
+    if (e) return e;
     duckdb_result res;
-    LUA_LOCK();  /* P4: g_conn is shared across threads */
     duckdb_state st = duckdb_query(g_conn, sql, &res);
+    /* NOTE: result reading (fetch_chunk loop) happens OUTSIDE the lock —
+     * safe: res is owned by this call; bridge_busy was cleared before it,
+     * so a UDF inside a later query may legally call the bridge again. */
+    g_bridge_busy = 0;
     LUA_UNLOCK();
     if (st != DuckDBSuccess) {
         const char *err = duckdb_result_error(&res);
@@ -3058,10 +3099,19 @@ void luajit_register_module_functions(
     lua_lock_init();
     L_();
 
-    /* Create persistent connection for Lua→DuckDB callbacks */
-    if (!g_conn) {
+    /* Create persistent connection for Lua→DuckDB callbacks.
+     * P0-3 (found via sqllogictest multi-file runs): a process can host
+     * several databases (one per test file, each LOADing this extension).
+     * g_conn used to bind to the FIRST one forever — quick_compile macros
+     * then landed in a dead catalog ("OK" but function missing). Rebind to
+     * the database currently registering us when it changes. */
+    {
         duckdb_database *db = acc->get_database(ei);
-        if (db) duckdb_connect(*db, &g_conn);
+        if (db && (!g_conn || g_conn_db != *db)) {
+            if (g_conn) duckdb_disconnect(&g_conn);
+            duckdb_connect(*db, &g_conn);
+            g_conn_db = *db;
+        }
     }
 
     #define REG(name,fn,rt) do{\

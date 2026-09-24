@@ -1,0 +1,43 @@
+# name: test/sql/luajit_bridge_boundary.test
+# description: _duckdb_query bridge reentrancy boundary (P0-3, offline)
+# group: [luajit]
+
+require luajit
+
+statement ok
+SELECT 1
+
+# ── ALLOWED: UDF querying its own table (MVCC snapshot read) ──
+
+statement ok
+CREATE TABLE t AS SELECT range AS i FROM range(5)
+
+query T
+SELECT message FROM luajit_module(mode := 'quick_compile', sql_name := 'cnt',
+  source := 'return function(x) local r = _duckdb_query("SELECT count(*) c FROM t") return tonumber(r[1].c) end')
+----
+OK
+
+query I
+SELECT cnt(0)
+----
+5
+
+# ── BLOCKED: nested reentrancy (UDF inside bridge SQL calling the bridge
+#    again). Pre-fix this deadlocked on the g_conn connection lock forever;
+#    now it must raise a hard, actionable error immediately. ──
+
+# inner probe: captures its own bridge error via pcall
+statement ok
+SELECT message FROM luajit_module(mode := 'quick_compile', sql_name := 'lj_inner_probe',
+  source := 'return function(x) local ok, err = pcall(_duckdb_query, "SELECT 1 AS v") if not ok then return "PCALL_ERR: " .. tostring(err) end return "BRIDGE_OK" end')
+
+# outer: bridge query that runs the inner probe UDF inside it
+statement ok
+SELECT message FROM luajit_module(mode := 'quick_compile', sql_name := 'lj_outer_probe',
+  source := 'return function(x) local r = _duckdb_query("SELECT lj_inner_probe(1) AS p") return "outer-got: " .. tostring(r[1].p) end')
+
+query T
+SELECT lj_outer_probe(1)
+----
+outer-got: PCALL_ERR: _duckdb_query reentrancy blocked — a UDF called from bridge SQL is calling back into SQL; break the cycle (e.g. materialize the inner result first)
