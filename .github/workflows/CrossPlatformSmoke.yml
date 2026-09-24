@@ -1,0 +1,45 @@
+# Cross-platform smoke tests for platforms where the full sqllogictest suite
+# is skipped in the main distribution pipeline (macOS arm64/x64, Windows).
+# Downloads the artifacts built by MainDistributionPipeline (no rebuild),
+# installs a pip duckdb matching the build version, runs ~10 assertion-level
+# checks. Review P1-1: "no platform left at zero assertions".
+name: Cross-platform smoke
+on:
+  workflow_run:
+    workflows: [Main Extension Distribution Pipeline]
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            arch: arm64
+            artifact: luajit-v1.5.5-extension-osx_arm64
+          - os: macos-15
+            arch: x64
+            artifact: luajit-v1.5.5-extension-osx_amd64
+          - os: windows-latest
+            arch: x64
+            artifact: luajit-v1.5.5-extension-windows_amd64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: pip duckdb (build version)
+        run: pip install duckdb==1.5.5
+      - name: Download artifact
+        uses: dawidd6/action-download-artifact@v11
+        with:
+          name: ${{ matrix.artifact }}
+          workflow: Main Extension Distribution Pipeline
+          path: ext
+      - name: Run smoke
+        run: python scripts/smoke_cross_platform.py ext/luajit.duckdb_extension

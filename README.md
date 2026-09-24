@@ -129,6 +129,22 @@ Remote lib installs are sha256-verified against `INDEX.v2` (after download
 **and** on cache hit) — tampered sources fail closed. Details and reporting:
 see [SECURITY.md](.github/SECURITY.md) and [MAINTAINERS.md](MAINTAINERS.md).
 
+## Platform support & test coverage
+
+| Platform | Builds | Test coverage |
+|---|---|---|
+| linux_amd64 | ✓ | full sqllogictest (CI) |
+| linux_arm64 | ✓ | build only |
+| osx_arm64 / osx_amd64 | ✓ | smoke suite (10 assertions, CI) |
+| windows_amd64 | ✓ | smoke suite (10 assertions, CI) |
+| wasm | ✗ | not supported (LuaJIT toolchain) — see [ROADMAP.md](ROADMAP.md) |
+
+Full sqllogictest runs only on linux_amd64 (historical macOS/Windows LuaJIT
+behaviour differences, e.g. `luajit_table` serialization requires
+`set_max_threads(1)` there). Since v0.33 every platform runs at least the
+cross-platform smoke suite (`scripts/smoke_cross_platform.py`, wired via
+`CrossPlatformSmoke.yml`) — no platform ships with zero assertions.
+
 ## Benchmark
 
 Reproducible micro-benchmarks live in [`benchmark/`](benchmark/run.py) —
