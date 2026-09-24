@@ -11,6 +11,9 @@ on:
     branches: [master]
   workflow_dispatch:
 
+permissions:
+  actions: read
+
 jobs:
   smoke:
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
@@ -36,10 +39,11 @@ jobs:
       - name: pip duckdb (build version)
         run: pip install duckdb==1.5.5
       - name: Download artifact
-        uses: dawidd6/action-download-artifact@v11
+        uses: actions/download-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          workflow: Main Extension Distribution Pipeline
           path: ext
+          run-id: ${{ github.event.workflow_run.id || github.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Run smoke
         run: python scripts/smoke_cross_platform.py ext/luajit.duckdb_extension
