@@ -1,0 +1,57 @@
+# name: test/sql/luajit_security.test
+# description: security levels (full/restricted/sandbox) offline anchors
+# group: [luajit]
+
+require luajit
+
+statement ok
+SELECT 1
+
+# ── restricted: shell exec / arbitrary require hard-blocked, os.date kept,
+#    DuckDB bridge kept (action libs). ffi allowlist paths are machine-
+#    specific (need ~/.duckdb/luajit-ffi) — verified in live E2E, not here. ──
+
+statement ok
+SELECT * FROM luajit_module(mode := 'security', source := 'restricted')
+
+query T
+SELECT luajit('io.popen("echo hi") return "ran"')
+----
+[string "lj"]:1: blocked by luajit security level 'restricted'
+
+query T
+SELECT luajit('os.execute("echo hi") return "ran"')
+----
+[string "lj"]:1: blocked by luajit security level 'restricted'
+
+query T
+SELECT luajit('local ok = pcall(require, "string") return "req=" .. tostring(ok)')
+----
+req=false
+
+# os.date survives restricted (non-dangerous)
+
+query T
+SELECT luajit('return os.date("%Y")') >= '2026'
+----
+true
+
+# unknown level → structured error
+
+statement ok
+SELECT message FROM luajit_module(mode := 'security', source := 'bogus')
+
+# ── sandbox: existing trusted semantics (io removed, os reduced) ──
+
+statement ok
+SELECT * FROM luajit_module(mode := 'security', source := 'sandbox')
+
+query T
+SELECT luajit('return type(io)')
+----
+nil
+
+query T
+SELECT luajit('return os.date("%Y")') >= '2026'
+----
+true

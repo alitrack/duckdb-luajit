@@ -109,7 +109,6 @@ static char *g_last_error = NULL;
  * mode can be toggled back off. Toggle via luajit_module(mode:='trusted',
  * source:='on'|'off'). Guarded by LUA_LOCK; applied to every state (existing
  * + newly created in L_()). */
-static bool g_trusted = false;
 
 /* Shared UDF source table: name → source. Compiled per-state on demand. */
 #define MAX_UDFS 256
@@ -168,6 +167,173 @@ static bool udf_source_del(const char *name) {
     if (g_trusted && !_lj_tr) apply_trusted(L, true); \
     else if (!g_trusted && _lj_tr) apply_trusted(L, false);
 #define LUA_CLEANUP() lua_cleanup:
+
+static bool g_trusted = false;
+
+/* ── P0-2: security levels (independent review 2026-09-24) ──
+ * full      = everything (default, backward compatible)
+ * restricted= no shell exec / no require-package-load*-debug /
+ *             ffi.load ONLY from ~/.duckdb/luajit-ffi/ allowlist dir
+ *             (realpath-checked); _duckdb_query bridge kept (etl libs)
+ * sandbox   = trusted sandbox (io/ffi/bridge all removed)
+ * Declared via env LUAJIT_SECURITY_LEVEL (service deployments) or
+ * luajit_module(mode := 'security', source := 'restricted'). */
+typedef enum { SEC_FULL = 0, SEC_RESTRICTED, SEC_SANDBOX } sec_level_t;
+static sec_level_t g_sec_level = SEC_FULL;
+
+/* "full"/"restricted"/"sandbox" → level; -1 on unknown */
+static int sec_parse(const char *s) {
+    if (!s) return -1;
+    if (!strcmp(s, "full")) return SEC_FULL;
+    if (!strcmp(s, "restricted")) return SEC_RESTRICTED;
+    if (!strcmp(s, "sandbox")) return SEC_SANDBOX;
+    /* accept trusted-mode aliases for the sandbox level */
+    if (!strcmp(s, "trusted")) return SEC_SANDBOX;
+    return -1;
+}
+
+/* defined later (install-chain section); needed early for the ffi allowlist */
+static const char *lib_cache_home(void);
+
+static void init_sec_level_from_env(void) {
+    const char *v = getenv("LUAJIT_SECURITY_LEVEL");
+    int lv = sec_parse(v);
+    if (lv >= 0) g_sec_level = (sec_level_t)lv;
+}
+
+/* Restricted: ffi.load allowlist dir (~/.duckdb/luajit-ffi/). Buffers are
+ * small; snprintf truncation is fine (paths longer than this fail closed). */
+static void ffi_allowlist_dir(char *buf, size_t bufsz) {
+    snprintf(buf, bufsz, "%s/.duckdb/luajit-ffi", lib_cache_home());
+}
+
+/* C-closure guards: raise a hard error instead of executing. Restricted
+ * mode REPLACES the dangerous functions with these — nothing is stashed,
+ * so Lua-side digging (metatables, registry) cannot recover originals. */
+static int lj_guard_error(lua_State *L) {
+    return luaL_error(L, "blocked by luajit security level 'restricted'");
+}
+/* require replacement (restricted): ONLY 'ffi' is loadable — LuaJIT does not
+ * register ffi as a global (it comes from require), and FFI libs are the
+ * core use case of the ffi.load allowlist, so require must stay usable for
+ * ffi alone. Everything else raises. The original require is stashed under
+ * a C-only registry key for delegation (it handles the builtin ffi loader
+ * and caching in package.loaded). */
+static int lj_require_guard(lua_State *L) {
+    const char *mod = luaL_checkstring(L, 1);
+    if (strcmp(mod, "ffi") != 0)
+        return luaL_error(L,
+            "require('%s') blocked by luajit security level 'restricted' (only 'ffi' is loadable)", mod);
+    lua_getfield(L, LUA_REGISTRYINDEX, "lj_orig_require");
+    if (!lua_isfunction(L, -1))
+        return luaL_error(L, "require('ffi') unavailable (original require missing)");
+    lua_pushstring(L, mod);
+    lua_call(L, 1, 1);
+    return 1;
+}
+/* ffi.load replacement: allowlist check in C, then the real ffi.load from
+ * the stashed original (this ONE function needs the original — stashed
+ * under a registry key only reachable from C). */
+static int lj_ffi_load_guard(lua_State *L) {
+    const char *name = luaL_checkstring(L, 1);
+    /* resolve what ffi.load would try to load: a bare name may map to
+     * lib<name>.so / <name>.so etc. Rather than emulating that, require an
+     * explicit absolute path and realpath it. */
+    if (name[0] != '/') {
+        return luaL_error(L,
+            "ffi.load blocked (restricted): give an absolute path inside the allowlist dir ~/.duckdb/luajit-ffi/");
+    }
+    /* glibc fortify: realpath output buffers must be >= PATH_MAX (4096) */
+    char real[4096];
+    char allow[4096];
+    char realallow[4096];
+    if (!realpath(name, real))
+        return luaL_error(L, "ffi.load blocked (restricted): cannot resolve %s", name);
+    ffi_allowlist_dir(allow, sizeof(allow));
+    if (!realpath(allow, realallow))
+        return luaL_error(L, "ffi.load blocked (restricted): allowlist dir %s missing — create it", allow);
+    size_t n = strlen(realallow);
+    if (strncmp(real, realallow, n) != 0 || (real[n] != '/' && real[n] != 0))
+        return luaL_error(L,
+            "ffi.load blocked (restricted): %s is outside allowlist dir %s", real, realallow);
+    /* inside allowlist → call the real ffi.load (registry-stashed) */
+    lua_getfield(L, LUA_REGISTRYINDEX, "lj_orig_ffi_load");
+    lua_pushstring(L, real);
+    lua_call(L, 1, 1);
+    return 1;
+}
+
+/* Apply restricted guards to L. Idempotent: functions already replaced →
+ * their upvalue-free C closures are identical, re-replace is a no-op.
+ * Nothing is restorable from Lua. Restoring to full requires re-init of
+ * the state (mode:='security' source:='full' does a full reset). */
+static void apply_restricted(lua_State *L) {
+    if (!L) return;
+    /* Idempotency: re-applying would stash the guard itself as the
+     * "original" (ffi.load / require) → infinite recursion on delegation.
+     * One-shot per state. */
+    lua_getfield(L, LUA_REGISTRYINDEX, "lj_restricted_applied");
+    bool already = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    if (already) return;
+    /* 0. load the ffi module FIRST — LuaJIT does not register ffi as a
+     * global (it comes from require), so lua_getglobal("ffi") is nil here.
+     * Require it now (before require gets guarded) and guard its load. */
+    lua_getglobal(L, "require");
+    if (lua_isfunction(L, -1)) {
+        lua_pushstring(L, "ffi");
+        if (lua_pcall(L, 1, 1, 0) == LUA_OK && lua_istable(L, -1)) {
+            lua_getfield(L, -1, "load");
+            if (lua_isfunction(L, -1))
+                lua_setfield(L, LUA_REGISTRYINDEX, "lj_orig_ffi_load"); /* pops */
+            else
+                lua_pop(L, 1);
+            lua_pushcfunction(L, lj_ffi_load_guard);
+            lua_setfield(L, -2, "load");
+        } else {
+            lua_pop(L, 1); /* error object — no ffi available, nothing to guard */
+        }
+    } else {
+        lua_pop(L, 1);
+    }
+    /* 1. replace shell-exec & env capabilities */
+    static const char *guard_fns[] = {
+        "io.popen", "os.execute", "os.getenv", "os.remove", "os.rename",
+        "os.tmpname", NULL
+    };
+    for (int i = 0; guard_fns[i]; i++) {
+        char tbl[32]; char fn[64];
+        snprintf(tbl, sizeof(tbl), "%s", guard_fns[i]);
+        char *dot = strchr(tbl, '.');
+        if (!dot) continue;
+        *dot = 0;
+        snprintf(fn, sizeof(fn), "%s", dot + 1);
+        lua_getglobal(L, tbl);
+        if (lua_istable(L, -1)) {
+            /* replace with guard (do NOT stash — restricted is one-way) */
+            lua_pushcfunction(L, lj_guard_error);
+            lua_setfield(L, -2, fn);
+        }
+        lua_pop(L, 1);
+    }
+    /* 2. remove package/load-family/debug; require → ffi-only guard */
+    static const char *dead[] = {"package","load","loadstring",
+                                 "loadfile","dofile","debug",NULL};
+    for (int i = 0; dead[i]; i++) {
+        lua_pushnil(L);
+        lua_setglobal(L, dead[i]);
+    }
+    /* require: stash original (delegation needs it), replace with guard */
+    lua_getglobal(L, "require");
+    if (lua_isfunction(L, -1))
+        lua_setfield(L, LUA_REGISTRYINDEX, "lj_orig_require"); /* pops */
+    else
+        lua_pop(L, 1);
+    lua_pushcfunction(L, lj_require_guard);
+    lua_setglobal(L, "require");
+    lua_pushboolean(L, 1);
+    lua_setfield(L, LUA_REGISTRYINDEX, "lj_restricted_applied");
+}
 
 static void apply_trusted(lua_State *L, bool on) {
     if (!L) return;
@@ -372,8 +538,10 @@ static void L_(void) {
             /* P4: apply trusted sandbox to every (new) state if globally on */
             LUA_LOCK();
             bool trusted = g_trusted;
+            sec_level_t sec = g_sec_level;
             LUA_UNLOCK();
-            if (trusted) apply_trusted(g_lua, true);
+            if (trusted || sec == SEC_SANDBOX) apply_trusted(g_lua, true);
+            else if (sec == SEC_RESTRICTED) apply_restricted(g_lua);
         }
     }
 }
@@ -2297,6 +2465,42 @@ static void mod_init_locked(duckdb_init_info info) {
         return;
     }
 
+    /* ── security mode: set security level (full | restricted | sandbox) ──
+     * P0-2 from the independent review. restricted = one-way guards on the
+     * current states (no restore path); switching back to full requires a
+     * new session (states re-init in L_()). */
+    if(!strcmp(m,"security")){
+        int lv = sec_parse(d->source);
+        if(lv < 0){
+            char b[256];
+            snprintf(b,sizeof(b),"unknown level '%s' — use full | restricted | sandbox",
+                     d->source?d->source:"(null)");
+            d->msg=strdup(b);return;
+        }
+        LUA_LOCK();
+        g_sec_level = (sec_level_t)lv;
+        g_trusted = (lv == SEC_SANDBOX);   /* sandbox == trusted sandbox */
+        LUA_UNLOCK();
+        /* apply to the current states so it takes effect immediately */
+        if(g_lua){
+            if(lv == SEC_SANDBOX) apply_trusted(g_lua, true);
+            else if(lv == SEC_RESTRICTED) apply_restricted(g_lua);
+            /* SEC_FULL: existing restricted/sandbox states stay guarded —
+             * restoring requires a new session (fail-closed by design) */
+        }
+        static const char *names[] = {"full","restricted","sandbox"};
+        char b[512];
+        snprintf(b,sizeof(b),"security level = %s%s", names[lv],
+                 lv==SEC_FULL ? " (existing sandboxed/restricted states in this session stay guarded until restart)" : "");
+        d->ok=true;d->phase="security";
+        d->msg=strdup(b);
+        d->detail=strdup(
+            "full: everything (default) | "
+            "restricted: no shell exec, ffi.load only from ~/.duckdb/luajit-ffi/, no require/package/load*/debug | "
+            "sandbox: trusted sandbox (io/ffi removed)");
+        return;
+    }
+
     /* ── trusted mode: toggle sandbox (on/off) ── */
     if(!strcmp(m,"trusted")){
         const char *tsrc = d->source;
@@ -2850,6 +3054,7 @@ void luajit_register_module_functions(
     duckdb_connection conn, duckdb_extension_info ei, struct duckdb_extension_access *acc)
 {
     (void)ei;(void)acc;
+    init_sec_level_from_env();   /* P0-2: LUAJIT_SECURITY_LEVEL env gate */
     lua_lock_init();
     L_();
 
