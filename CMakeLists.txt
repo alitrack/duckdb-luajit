@@ -84,6 +84,7 @@ project(${EXTENSION_NAME} LANGUAGES C)
 set(EXTENSION_SOURCES
         src/luajit_entry.c
         src/luajit_module.c
+        src/sha256.c
         src/embedded/fennel_embedded.c
 )
 

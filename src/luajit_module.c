@@ -13,6 +13,8 @@
 
 #include "duckdb_extension.h"
 
+#include "sha256.h"
+
 DUCKDB_EXTENSION_EXTERN
 
 #ifdef LUAJIT_WASM_STUB
@@ -2022,12 +2024,131 @@ static void lib_cache_path(char *buf, size_t bufsz, const char *file) {
         if (*p == '\\') *p = '/';
 }
 
-/* Resolve a lib name to source: local cache → INDEX → fetch. Caller frees. */
+/* Parse one "name|path[|sha256[|version]]" line from an INDEX/INDEX.v2 body.
+ * Fields beyond the first two are optional (v2 sidecar). Returns 1 and fills
+ * name/path/sha256/version (each a copy into fixed buffers, NUL-terminated;
+ * sha256/version are "" when absent) when the line has a '|', else 0.
+ * sha256_out/version_out may be NULL when the caller doesn't care. */
+static int index_parse_line(const char *line, size_t linelen,
+                            char *name, size_t namesz,
+                            char *path, size_t pathsz,
+                            char *sha256_out, size_t sha256sz,
+                            char *version_out, size_t versionsz) {
+    const char *pipe = (const char *)memchr(line, '|', linelen);
+    if (!pipe) return 0;
+    size_t namelen = (size_t)(pipe - line);
+    if (namelen >= namesz) namelen = namesz - 1;
+    memcpy(name, line, namelen);
+    name[namelen] = 0;
+
+    /* second field: up to next '|' or EOL (v2 rows carry more columns) */
+    size_t restlen = linelen - namelen - 1;
+    const char *rest = pipe + 1;
+    const char *pipe2 = (const char *)memchr(rest, '|', restlen);
+    size_t pathlen = pipe2 ? (size_t)(pipe2 - rest) : restlen;
+    if (pathlen >= pathsz) pathlen = pathsz - 1;
+    memcpy(path, rest, pathlen);
+    path[pathlen] = 0;
+
+    if (sha256_out) {
+        sha256_out[0] = 0;
+        if (pipe2) {
+            size_t r2 = restlen - pathlen - 1;
+            const char *f3 = pipe2 + 1;
+            const char *pipe3 = (const char *)memchr(f3, '|', r2);
+            size_t l3 = pipe3 ? (size_t)(pipe3 - f3) : r2;
+            if (l3 >= sha256sz) l3 = sha256sz - 1;
+            memcpy(sha256_out, f3, l3);
+            sha256_out[l3] = 0;
+            if (version_out) {
+                version_out[0] = 0;
+                if (pipe3) {
+                    size_t l4 = r2 - l3 - 1;
+                    if (l4 >= versionsz) l4 = versionsz - 1;
+                    memcpy(version_out, pipe3 + 1, l4);
+                    version_out[l4] = 0;
+                }
+            }
+        } else if (version_out) {
+            version_out[0] = 0;
+        }
+    } else if (version_out) {
+        version_out[0] = 0;
+    }
+    return 1;
+}
+
+/* Look up NAME in the remote INDEX.v2 (falls back to legacy INDEX semantics
+ * when the v2 sidecar is absent — those rows simply carry no sha256).
+ * Returns 1 on hit and fills path/sha256/version; 0 on miss; -1 on network
+ * error (err_out set). Caches the sidecar like INDEX itself. */
+static int index_v2_lookup(const char *name,
+                           char *path, size_t pathsz,
+                           char *sha256_out, size_t sha256sz,
+                           char *version_out, size_t versionsz,
+                           char **err_out) {
+    char cache_file[2048];
+    lib_cache_path(cache_file, sizeof(cache_file), "INDEX.v2");
+
+    char *idx = NULL;
+    FILE *fp = fopen(cache_file, "r");
+    if (fp) {
+        fseek(fp, 0, SEEK_END);
+        long sz = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        idx = (char *)malloc((size_t)sz + 1);
+        size_t rd = fread(idx, 1, (size_t)sz, fp);
+        idx[rd] = 0;
+        fclose(fp);
+    } else {
+        char idx_url[2048];
+        snprintf(idx_url, sizeof(idx_url),
+                 "https://raw.githubusercontent.com/alitrack/duckdb-luajit-libs/main/INDEX.v2");
+        idx = fetch_url_content(idx_url, err_out);
+        if (!idx) return -1;
+        cache_write_file(cache_file, idx);
+    }
+
+    const char *p = idx;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t linelen = nl ? (size_t)(nl - p) : strlen(p);
+        char nm[512], sh[128], ver[64];
+        if (index_parse_line(p, linelen, nm, sizeof(nm), path, pathsz,
+                             sh, sizeof(sh), ver, sizeof(ver)) &&
+            !strcmp(nm, name)) {
+            if (sha256_out) snprintf(sha256_out, sha256sz, "%s", sh);
+            if (version_out) snprintf(version_out, versionsz, "%s", ver);
+            free(idx);
+            return 1;
+        }
+        if (!nl) break;
+        p = nl + 1;
+    }
+    free(idx);
+    return 0;
+}
+
+/* Resolve a lib name to source with integrity check. Priority:
+ *   1. local cache hit — if a local INDEX.v2 entry exists for the lib,
+ *      verify the cached file against its sha256 (cache-poisoning guard);
+ *      no entry / no hash → accept (offline path stays usable).
+ *   2. remote fetch via INDEX.v2 (sha256 mandatory when present: mismatch =
+ *      hard fail, nothing cached) with legacy INDEX fallback (no hash known,
+ *      same trust level as before v2 existed).
+ * Caller frees. */
 static char *lib_fetch_source(bind_t *d, const char *name, char **err_out) {
     char cache_file[2048];
     char cache_name[512];
     snprintf(cache_name, sizeof(cache_name), "%s.lua", name);
     lib_cache_path(cache_file, sizeof(cache_file), cache_name);
+
+    char want_hash[128] = "", want_ver[64] = "", meta_path[1024] = "";
+    int have_meta = index_v2_lookup(name, meta_path, sizeof(meta_path),
+                                    want_hash, sizeof(want_hash),
+                                    want_ver, sizeof(want_ver), NULL);
+    /* have_meta: 1 = v2 entry with hash, 0 = not listed, -1 = network error
+     * (tolerated: cache/legacy paths still work offline). */
 
     /* 1. local cache */
     FILE *fp = fopen(cache_file, "r");
@@ -2039,6 +2160,20 @@ static char *lib_fetch_source(bind_t *d, const char *name, char **err_out) {
         size_t rd = fread(src, 1, (size_t)sz, fp);
         src[rd] = 0;
         fclose(fp);
+        if (have_meta == 1 && want_hash[0]) {
+            char got[65];
+            sha256_hex(src, rd, got);
+            if (strcmp(got, want_hash) != 0) {
+                free(src);
+                char b[512];
+                snprintf(b, sizeof(b),
+                    "sha256 mismatch on cached '%s': expected %.12s…, got %.12s… "
+                    "(cache may be stale or tampered — run luajit_module(mode := 'upgrade', sql_name := '%s') to re-fetch)",
+                    name, want_hash, got, name);
+                if (err_out) *err_out = strdup(b);
+                return NULL;
+            }
+        }
         return src;
     }
 
@@ -2048,42 +2183,54 @@ static char *lib_fetch_source(bind_t *d, const char *name, char **err_out) {
     if (d->source && (strstr(d->source, "http://") || strstr(d->source, "https://"))) {
         snprintf(url, sizeof(url), "%s", d->source);
     } else {
-        char idx_url[2048];
-        snprintf(idx_url, sizeof(idx_url), "%s/INDEX", base);
-        char *idx = fetch_url_content(idx_url, err_out);
-        if (!idx) return NULL;
-        /* parse "name|path" per line — manual scan, portable (no strtok_r) */
         char path[1024] = "";
-        const char *p = idx;
-        while (*p) {
-            const char *nl = strchr(p, '\n');
-            size_t linelen = nl ? (size_t)(nl - p) : strlen(p);
-            const char *pipe = (const char *)memchr(p, '|', linelen);
-            if (pipe) {
-                size_t namelen = (size_t)(pipe - p);
-                if (namelen == strlen(name) && !memcmp(p, name, namelen)) {
-                    size_t pathlen = linelen - namelen - 1;
-                    if (pathlen >= sizeof(path)) pathlen = sizeof(path) - 1;
-                    memcpy(path, pipe + 1, pathlen);
-                    path[pathlen] = 0;
-                    break;
-                }
-            }
-            if (!nl) break;
-            p = nl + 1;
-        }
-        free(idx);
+        if (have_meta == 1 && meta_path[0])
+            snprintf(path, sizeof(path), "%s", meta_path);
         if (!path[0]) {
-            char b[512];
-            snprintf(b, sizeof(b), "lib '%s' not found in INDEX", name);
-            if (err_out) *err_out = strdup(b);
-            return NULL;
+            /* legacy INDEX fallback (2-column) */
+            char idx_url[2048];
+            snprintf(idx_url, sizeof(idx_url), "%s/INDEX", base);
+            char *idx = fetch_url_content(idx_url, err_out);
+            if (!idx) return NULL;
+            const char *p = idx;
+            while (*p) {
+                const char *nl = strchr(p, '\n');
+                size_t linelen = nl ? (size_t)(nl - p) : strlen(p);
+                char nm[512];
+                if (index_parse_line(p, linelen, nm, sizeof(nm), path, sizeof(path), NULL, 0, NULL, 0) &&
+                    !strcmp(nm, name))
+                    break;
+                path[0] = 0;
+                if (!nl) break;
+                p = nl + 1;
+            }
+            free(idx);
+            if (!path[0]) {
+                char b[512];
+                snprintf(b, sizeof(b), "lib '%s' not found in INDEX", name);
+                if (err_out) *err_out = strdup(b);
+                return NULL;
+            }
         }
         snprintf(url, sizeof(url), "%s/%s", base, path);
     }
 
     char *src = fetch_url_content(url, err_out);
     if (!src) return NULL;
+    /* integrity gate: verify BEFORE caching or compiling */
+    if (have_meta == 1 && want_hash[0]) {
+        char got[65];
+        sha256_hex(src, strlen(src), got);
+        if (strcmp(got, want_hash) != 0) {
+            free(src);
+            char b[512];
+            snprintf(b, sizeof(b),
+                "sha256 mismatch for '%s': expected %.12s…, got %.12s… — refusing to install",
+                name, want_hash, got);
+            if (err_out) *err_out = strdup(b);
+            return NULL;
+        }
+    }
     /* cache for offline reuse */
     cache_write_file(cache_file, src);
     return src;
@@ -2432,10 +2579,39 @@ static void mod_init_locked(duckdb_init_info info) {
         return;
     }
 
-    /* ── install mode: fetch lib from duckdb-luajit-libs, cache, register ── */
-    if(!strcmp(m,"install")){
+    /* ── sha256 mode: maintainer tool — hash a string or a cache file so
+     * INDEX.v2 rows can be authored; also the offline test anchor for the
+     * integrity gate (expected output = DuckDB's own sha256()). ── */
+    if(!strcmp(m,"sha256")){
+        const char *s = d->source;
+        if(!s){d->msg=strdup("need source (string to hash, or a file path)");return;}
+        char hex[65];
+        FILE *fp = fopen(s,"r");
+        if(fp){   /* path form: hash file contents */
+            fseek(fp,0,SEEK_END); long sz=ftell(fp); fseek(fp,0,SEEK_SET);
+            char *buf=(char*)malloc((size_t)sz+1);
+            size_t rd=fread(buf,1,(size_t)sz,fp); fclose(fp);
+            sha256_hex(buf,rd,hex); free(buf);
+        }else{    /* literal string form */
+            sha256_hex(s,strlen(s),hex);
+        }
+        d->ok=true;d->phase="sha256";
+        d->msg=strdup(hex);
+        return;
+    }
+
+    /* ── install / upgrade mode: fetch lib from duckdb-luajit-libs, verify
+     * sha256 (INDEX.v2), cache, register. upgrade first drops the cached
+     * lib + INDEX.v2 so the newest remote version is fetched. ── */
+    if(!strcmp(m,"install")||!strcmp(m,"upgrade")){
         if(!d->sql_name){d->msg=strdup("need sql_name (lib name) for install");return;}
         const char *name = d->sql_name;
+        if(!strcmp(m,"upgrade")){
+            char cf[2048]; char cn[512];
+            snprintf(cn,sizeof(cn),"%s.lua",name);
+            lib_cache_path(cf,sizeof(cf),cn); remove(cf);
+            lib_cache_path(cf,sizeof(cf),"INDEX.v2"); remove(cf);
+        }
         char *err = NULL;
         char *src = lib_fetch_source(d, name, &err);
         if(!src){

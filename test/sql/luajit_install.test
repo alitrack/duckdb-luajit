@@ -1,0 +1,38 @@
+# name: test/sql/luajit_install.test
+# description: install-chain integrity (sha256 mode anchors, offline)
+# group: [luajit]
+
+require luajit
+
+statement ok
+SELECT 1
+
+# ── sha256 tool mode: literal-string form must match FIPS 180-4 vectors ──
+# (also cross-checked against DuckDB's own sha256() — identical bit-for-bit)
+
+query T
+SELECT message FROM luajit_module(mode := 'sha256', source := 'abc')
+----
+ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+
+query T
+SELECT message FROM luajit_module(mode := 'sha256', source := 'abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq')
+----
+248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1
+
+# agreement with the engine's own implementation (empty string vector)
+
+query T
+SELECT (SELECT message FROM luajit_module(mode := 'sha256', source := '')) = sha256('')
+----
+true
+
+query T
+SELECT (SELECT message FROM luajit_module(mode := 'sha256', source := 'x')) = sha256('x')
+----
+true
+
+# sha256 mode without source → structured error, not a crash
+
+statement ok
+SELECT message FROM luajit_module(mode := 'sha256')
