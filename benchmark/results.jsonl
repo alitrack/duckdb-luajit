@@ -1,0 +1,6 @@
+{"ts": "2026-09-24T14:29:23", "name": "registered scalar x2 (row)", "rows": 1000000, "ms": 27.8, "m_rows_per_s": 35.91}
+{"ts": "2026-09-24T14:29:23", "name": "anonymous expr x*2 (row)", "rows": 1000000, "ms": 33.2, "m_rows_per_s": 30.16}
+{"ts": "2026-09-24T14:29:23", "name": "scalar string.format (row)", "rows": 1000000, "ms": 75.2, "m_rows_per_s": 13.3}
+{"ts": "2026-09-24T14:29:23", "name": "bridge lookup (100k)", "rows": 1000, "ms": 82.5, "m_rows_per_s": 0.01}
+{"ts": "2026-09-24T14:29:23", "name": "scalar x2 threads=1", "rows": 1000000, "ms": 27.8, "m_rows_per_s": 35.94}
+{"ts": "2026-09-24T14:29:23", "name": "scalar x2 threads=4", "rows": 1000000, "ms": 7.4, "m_rows_per_s": 135.73}

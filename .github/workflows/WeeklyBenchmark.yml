@@ -1,0 +1,42 @@
+# Weekly reproducible benchmark (review P1-2): catch performance
+# regressions on master and keep a results history in the artifacts.
+name: Weekly Benchmark
+on:
+  schedule:
+    - cron: '17 3 * * 1'   # Mondays 03:17 UTC
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      - name: Checkout Extension CI tools
+        uses: actions/checkout@v4
+        with:
+          repository: duckdb/extension-ci-tools
+          path: extension-ci-tools
+          ref: v1.5-variegata
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y ninja-build python3-pip
+      - name: Configure
+        run: make configure
+      - name: Build (release, gcc)
+        run: make release
+        env:
+          CC: gcc
+          CXX: g++
+      - name: Run benchmarks
+        run: |
+          ./configure/venv/bin/python3 benchmark/run.py | tee benchmark_run.md
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ github.run_id }}
+          path: |
+            benchmark_run.md
+            benchmark/results.jsonl
+          retention-days: 90

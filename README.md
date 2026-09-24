@@ -129,6 +129,22 @@ Remote lib installs are sha256-verified against `INDEX.v2` (after download
 **and** on cache hit) — tampered sources fail closed. Details and reporting:
 see [SECURITY.md](.github/SECURITY.md) and [MAINTAINERS.md](MAINTAINERS.md).
 
+## Benchmark
+
+Reproducible micro-benchmarks live in [`benchmark/`](benchmark/run.py) —
+column parameters (no constant folding), 3-repeat median, JSONL history
+in `benchmark/results.jsonl`. One command:
+
+```
+python3 benchmark/run.py            # 1M rows; --quick = 100k
+```
+
+Reference run (WSL, threads=1 unless noted, DuckDB 1.5.5): registered
+scalar UDF ~36 M rows/s; anonymous expression ~30 M rows/s; string.format
+~13 M rows/s; threads=4 scaling 3.8× on the scalar workload. The bridge
+lookup benchmark (~82 µs/call) measures the SQL-callback round-trip, not
+data throughput. Numbers are machine-specific — run the script for yours.
+
 ## Changelog
 
 - **v0.33**: security hardening (independent review 2026-09-24) —
