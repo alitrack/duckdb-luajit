@@ -317,10 +317,21 @@ static void apply_restricted(lua_State *L) {
         }
         lua_pop(L, 1);
     }
-    /* 2. remove package/load-family/debug; require → ffi-only guard */
+    /* 2. remove package/load-family/debug; require → ffi-only guard.
+     * debug gets STASHED to REGISTRY["debug"] first (same as trusted mode):
+     * one-way for Lua users (no debug.getregistry → unreachable), but the
+     * extension's internal arity probe (quick_compile) needs getinfo to
+     * determine nparams — without it every quick_compile after a security
+     * level change compiles 0-arg macros (CI: "Macro add() does not support
+     * the supplied arguments"). */
     static const char *dead[] = {"package","load","loadstring",
                                  "loadfile","dofile","debug",NULL};
     for (int i = 0; dead[i]; i++) {
+        lua_getglobal(L, dead[i]);
+        if (!lua_isnil(L, -1))
+            lua_setfield(L, LUA_REGISTRYINDEX, dead[i]); /* stash + pop */
+        else
+            lua_pop(L, 1);
         lua_pushnil(L);
         lua_setglobal(L, dead[i]);
     }
@@ -344,14 +355,20 @@ static void apply_trusted(lua_State *L, bool on) {
         static const char *dead[] = {"io","ffi","package","require","dofile",
                                      "loadfile","load","loadstring","debug",NULL};
         for (int i = 0; dead[i]; i++) {
-            /* stash original */
+            /* stash original under its own registry key, then nil the global.
+             * FIX (CI segfault, 2026-09-24): this block used to pop one MORE
+             * slot than it pushed when the global was non-nil — an
+             * unbalanced lua_pop that corrupted the C-stack frame below;
+             * later quick_compile probes then called a clobbered stack slot
+             * ("attempt to call a number value" → LuaJIT PANIC → abort).
+             * Also removed the bogus single "lj_orig" key (every global
+             * overwrote it); per-name keys are what restore() reads. */
             lua_getglobal(L, dead[i]);
             if (!lua_isnil(L, -1)) {
-                lua_pushvalue(L, -1);
-                lua_setfield(L, LUA_REGISTRYINDEX, "lj_orig");
-                lua_setfield(L, LUA_REGISTRYINDEX, dead[i]);
+                lua_setfield(L, LUA_REGISTRYINDEX, dead[i]); /* pops value */
+            } else {
+                lua_pop(L, 1);
             }
-            lua_pop(L, 1);
             lua_pushnil(L);
             lua_setglobal(L, dead[i]);
         }
@@ -685,7 +702,12 @@ static void fj(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out)
         ok=ok||lua_pcall(L,0,1,0);
         if(ok){duckdb_vector_assign_string_element(out,r,lua_tostring(L,-1));lua_pop(L,1);continue;}
         if(lua_isnil(L,-1))mark_invalid(out,r);
-        else{to_str(L);duckdb_vector_assign_string_element(out,r,lua_tostring(L,-1));lua_pop(L,1);}
+        else{to_str(L);duckdb_vector_assign_string_element(out,r,lua_tostring(L,-1));}
+        /* single pop for BOTH branches (nil / converted value). The old code
+         * popped inside the else AND here — a double pop on every successful
+         * call that pushed the TLS state's top below its base; subsequent
+         * quick_compile probes then read a clobbered stack slot and
+         * misclassified scalar UDFs as batch (CI: add(3,4) → NULL). */
         lua_pop(L,1);
     }
     LUA_CLEANUP();
@@ -2718,14 +2740,32 @@ static void mod_init_locked(duckdb_init_info info) {
             {d->msg=strdup(lua_tostring(L,-1));lua_pop(L,1);return;}
         if(!lua_isfunction(L,-1))
             {d->msg=strdup("must return a function");lua_pop(L,1);return;}
-        /* Step 2: probe arity */
+        /* Step 2: probe arity. P0-2 followup fix: `debug` may be REMOVED
+         * (restricted/sandbox security levels) — getfield on nil raises a
+         * Lua error outside any pcall → LuaJIT panic → process abort.
+         * Seen in CI: parallel sqllogictest files, one setting
+         * LUAJIT_SECURITY_LEVEL state while another quick_compiles.
+         * Stack discipline: save top, restore with lua_settop — branchy
+         * manual popping left the stack imbalanced when debug is absent
+         * (popped the function itself → probes called the wrong object). */
         int np=0;
+        int top0 = lua_gettop(L);
         lua_pushvalue(L,-1);
-        lua_getglobal(L,"debug");lua_getfield(L,-1,"getinfo");
-        lua_pushvalue(L,-3);lua_pushstring(L,"u");
-        if(lua_pcall(L,2,1,0)==LUA_OK&&lua_istable(L,-1))
-            {lua_getfield(L,-1,"nparams");np=(int)lua_tointeger(L,-1);lua_pop(L,1);}
-        lua_pop(L,2);lua_pop(L,1);
+        /* arity probe: prefer the REGISTRY-stashed debug.getinfo — sandbox/
+         * restricted levels remove the global, but stash it C-side for
+         * exactly this internal use (unreachable from Lua). Fallback to the
+         * global for full-level states. */
+        lua_getfield(L, LUA_REGISTRYINDEX, "debug");
+        if (!lua_istable(L, -1)) { lua_pop(L, 1); lua_getglobal(L, "debug"); }
+        if (lua_istable(L,-1)) {
+            lua_getfield(L,-1,"getinfo");
+            if (lua_isfunction(L,-1)) {
+                lua_pushvalue(L,-3);lua_pushstring(L,"u");
+                if(lua_pcall(L,2,1,0)==LUA_OK&&lua_istable(L,-1))
+                    {lua_getfield(L,-1,"nparams");np=(int)lua_tointeger(L,-1);lua_pop(L,1);}
+            }
+        }
+        lua_settop(L, top0);
         /* Step 3: probe return type AND calling style.
          * Probe A — scalar with integer 0 (numeric scalar UDFs)
          * Probe B — scalar with "0-0-0" (date/string-pattern scalar UDFs)
