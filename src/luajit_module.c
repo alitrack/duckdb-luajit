@@ -167,7 +167,12 @@ static bool udf_source_del(const char *name) {
     lua_getfield(L, LUA_REGISTRYINDEX, "lj_trusted_applied"); \
     int _lj_tr = lua_toboolean(L, -1); lua_pop(L, 1); \
     if (g_trusted && !_lj_tr) apply_trusted(L, true); \
-    else if (!g_trusted && _lj_tr) apply_trusted(L, false);
+    else if (!g_trusted && _lj_tr) apply_trusted(L, false); \
+    /* restricted must also reach states created BEFORE the level switch \
+     * (TLS states on other threads — Windows smoke caught this: UDF on a \
+     * full-era state ran io.popen). One-way + idempotent (registry flag), \
+     * so unconditional apply is fail-closed. */ \
+    if (g_sec_level == SEC_RESTRICTED) apply_restricted(L);
 #define LUA_CLEANUP() lua_cleanup:
 
 static bool g_trusted = false;
