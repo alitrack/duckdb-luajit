@@ -116,12 +116,29 @@ SELECT luajit_s('base64', 'hello');   -- aGVsbG8=
 
 ## Security
 
-trusted sandbox mode removes `io/os/ffi/package/require/load*` (no filesystem /
-network / syscall access); normal mode keeps the full Lua capability set (files,
-FFI, `_duckdb_query` callback). Default: not trusted.
+Three levels — `luajit_module(mode := 'security', source := 'full'|'restricted'|'sandbox')`
+or env `LUAJIT_SECURITY_LEVEL` for service deployments:
+
+| Level | Use when | What it blocks |
+|---|---|---|
+| `full` (default) | local dev, trusted scripts | nothing (full Lua: files, FFI, shell) |
+| `restricted` | shared/reporting environments | shell exec (`io.popen`/`os.execute`), env/temp-file tampering, `require` (except `ffi`), and `ffi.load` outside the `~/.duckdb/luajit-ffi/` allowlist |
+| `sandbox` | fully untrusted input | `io`/`ffi`/`require`/`load*` removed, `os` reduced to date/time |
+
+Remote lib installs are sha256-verified against `INDEX.v2` (after download
+**and** on cache hit) — tampered sources fail closed. Details and reporting:
+see [SECURITY.md](.github/SECURITY.md) and [MAINTAINERS.md](MAINTAINERS.md).
 
 ## Changelog
 
+- **v0.33**: security hardening (independent review 2026-09-24) —
+  `INDEX.v2` sha256 verification for remote lib installs (fail-closed,
+  cache-poisoning defense, `upgrade` mode to refresh); security levels
+  `full`/`restricted`/`sandbox` with an FFI allowlist dir
+  (`~/.duckdb/luajit-ffi/`) and env gate `LUAJIT_SECURITY_LEVEL`; bridge
+  reentrancy boundary (nested `_duckdb_query` hard-errors instead of
+  deadlocking); multi-database `g_conn` rebind fix; `sha256` helper mode;
+  MAINTAINERS.md / SECURITY.md governance docs
 - **v0.32**: UDF lifecycle closed loop — registrations persist into a
   `luajit_udf_registry` table in the current database file; UDFs auto-restore
   on `LOAD` when reopening the same .db, do NOT leak into other databases;
