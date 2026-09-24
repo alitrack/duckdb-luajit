@@ -38,12 +38,25 @@ jobs:
           python-version: '3.11'
       - name: pip duckdb (build version)
         run: pip install duckdb==1.5.5
+      - name: Resolve pipeline run id
+        shell: bash
+        run: |
+          # workflow_run context carries the triggering run's id; for manual
+          # dispatch resolve the latest successful pipeline run instead.
+          if [ -n "${{ github.event.workflow_run.id }}" ]; then
+            echo "RID=${{ github.event.workflow_run.id }}" >> "$GITHUB_ENV"
+          else
+            rid=$(gh api "repos/${{ github.repository }}/actions/workflows/321792097/runs?status=success&per_page=1" --jq '.workflow_runs[0].id')
+            echo "RID=$rid" >> "$GITHUB_ENV"
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ext
-          run-id: ${{ github.event.workflow_run.id || github.run_id }}
+          run-id: ${{ env.RID }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Run smoke
         run: python scripts/smoke_cross_platform.py ext/luajit.duckdb_extension
