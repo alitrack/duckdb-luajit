@@ -135,7 +135,8 @@ see [SECURITY.md](.github/SECURITY.md) and [MAINTAINERS.md](MAINTAINERS.md).
 |---|---|---|
 | linux_amd64 | ✓ | full sqllogictest (CI) |
 | linux_arm64 | ✓ | build only |
-| osx_arm64 / osx_amd64 | ✓ | smoke suite (10 assertions, CI) |
+| osx_arm64 | ✓ | smoke suite (10 assertions, CI) |
+| osx_amd64 | ✓ | build only (GitHub retired Intel macOS runners) |
 | windows_amd64 | ✓ | smoke suite (10 assertions, CI) |
 | wasm | ✗ | not supported (LuaJIT toolchain) — see [ROADMAP.md](ROADMAP.md) |
 

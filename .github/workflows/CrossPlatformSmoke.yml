@@ -22,12 +22,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # osx_amd64: macOS runners are Apple Silicon only (Intel runners
+          # retired by GitHub) — that artifact stays build-only, verified
+          # on linux via Rosetta-less CI compile.
           - os: macos-15
             arch: arm64
             artifact: luajit-v1.5.5-extension-osx_arm64
-          - os: macos-15
-            arch: x64
-            artifact: luajit-v1.5.5-extension-osx_amd64
           - os: windows-latest
             arch: x64
             artifact: luajit-v1.5.5-extension-windows_amd64
