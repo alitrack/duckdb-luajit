@@ -10,6 +10,24 @@ Self-contained DuckDB extension for Lua expressions, JIT-compiled UDFs, and nest
 
 中文版说明见 [README_cn.md](README_cn.md) / Chinese version: [README_cn.md](README_cn.md)
 
+## Which function do I need? (90% of users: 3 lines)
+
+```text
+Just compute something once
+ └─ SELECT luajit_i/f/s('return <expr using x>', arg)      -- anonymous, use-and-discard
+Used it more than twice / hot path?
+ └─ luajit_module(mode := 'quick_compile', sql_name := 'f', source := 'return function(a,b) ... end')
+     └─ then SELECT f(3, 4) like a normal SQL function     -- auto return-type, macro
+Anything harder
+ └─ rows from Lua      → luajit_table('return {"a","b"}')
+ └─ aggregation        → luajit_module(mode := 'agg', ...)
+ └─ a ready-made lib   → luajit_module(mode := 'install', sql_name := 'json')
+ └─ SQL from inside Lua→ _duckdb_query('SELECT ...') within a UDF
+ └─ native code        → FFI (ffi.load from ~/.duckdb/luajit-ffi/ under 'restricted')
+```
+
+Full function/mode reference: [Function Overview](#function-overview).
+
 ## Quick Start
 
 ```sql
@@ -213,8 +231,10 @@ data throughput. Numbers are machine-specific — run the script for yours.
 
 ## Resources
 
+- **[Troubleshooting](docs/troubleshooting.md)** — NULL-returning UDFs, security-level
+  side effects, FFI allowlist, bridge boundaries, install/cache pitfalls
 - [duckdb-luajit-libs](https://github.com/alitrack/duckdb-luajit-libs) — Lua library
-  repo (categories + install protocol + ROADMAP)
+  repo (categories + install protocol + SBOM + maturity tiers + ROADMAP)
 - WeChat articles (Chinese): type bridges / signed-API data sources / DICOM
   (83 lines) / directory scan (110 lines)
 - Community extension PR: duckdb/community-extensions#2428
