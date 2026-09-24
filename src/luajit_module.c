@@ -30,6 +30,7 @@ void luajit_register_module_functions(
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <ctype.h>
 
 /* MSVC lacks __attribute__((noinline)); use __declspec(noinline) there. */
 #if defined(_MSC_VER)
@@ -240,21 +241,33 @@ static int lj_ffi_load_guard(lua_State *L) {
     /* resolve what ffi.load would try to load: a bare name may map to
      * lib<name>.so / <name>.so etc. Rather than emulating that, require an
      * explicit absolute path and realpath it. */
-    if (name[0] != '/') {
+    if (name[0] != '/' && name[0] != '\\'
+        && !(isalpha((unsigned char)name[0]) && name[1] == ':')) {
         return luaL_error(L,
             "ffi.load blocked (restricted): give an absolute path inside the allowlist dir ~/.duckdb/luajit-ffi/");
     }
-    /* glibc fortify: realpath output buffers must be >= PATH_MAX (4096) */
+    /* glibc fortify: realpath output buffers must be >= PATH_MAX (4096).
+     * Portability: MSVC has no realpath — use _fullpath there. */
     char real[4096];
     char allow[4096];
     char realallow[4096];
+#ifdef _WIN32
+    if (!_fullpath(real, name, sizeof(real)))
+#else
     if (!realpath(name, real))
+#endif
         return luaL_error(L, "ffi.load blocked (restricted): cannot resolve %s", name);
     ffi_allowlist_dir(allow, sizeof(allow));
+#ifdef _WIN32
+    if (!_fullpath(realallow, allow, sizeof(realallow)))
+#else
     if (!realpath(allow, realallow))
+#endif
         return luaL_error(L, "ffi.load blocked (restricted): allowlist dir %s missing — create it", allow);
     size_t n = strlen(realallow);
-    if (strncmp(real, realallow, n) != 0 || (real[n] != '/' && real[n] != 0))
+    /* path-separator tolerance: _fullpath yields backslashes on Windows */
+    if (strncmp(real, realallow, n) != 0
+        || (real[n] != '/' && real[n] != '\\' && real[n] != 0))
         return luaL_error(L,
             "ffi.load blocked (restricted): %s is outside allowlist dir %s", real, realallow);
     /* inside allowlist → call the real ffi.load (registry-stashed) */
