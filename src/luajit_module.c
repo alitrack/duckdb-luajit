@@ -2170,6 +2170,7 @@ static void tbt_func(duckdb_function_info fi, duckdb_data_chunk out) {
 
 typedef struct {
     char *mode, *source, *sql_name, *msg, *detail, *phase;
+    char *table_macro;   /* optional (install/quick_compile): wrap luajit_table in a named TABLE MACRO */
     bool ok;
 } bind_t;
 typedef struct { bool done; } state_t;
@@ -2511,12 +2512,21 @@ static char *lib_fetch_index(char **err_out) {
     return idx;
 }
 
+/* Mirror the ORIGINAL bare `free` destructor semantics: release only the
+ * bind_t struct itself, NOT its string fields. (Several fields are assigned
+ * string LITERALS, e.g. `d->phase="info"`, which are rodata — freeing them
+ * would crash. The fields leak, exactly as before this change; bind data is
+ * short-lived per query, so the pre-existing leak is acceptable.) */
+static void bind_free(void *p) {
+    free(p);
+}
 static void mod_bind(duckdb_bind_info info) {
     bind_t *d=(bind_t*)duckdb_malloc(sizeof(bind_t));
     memset(d,0,sizeof(*d));d->mode=strdup("info");
     #define G(n,f)do{duckdb_value v=duckdb_bind_get_named_parameter(info,n);\
         if(v){free(d->f);d->f=strdup(duckdb_get_varchar(v));duckdb_destroy_value(&v);}}while(0)
     G("mode",mode);G("source",source);G("sql_name",sql_name);
+    G("table_macro",table_macro);
     #undef G
     duckdb_bind_add_result_column(info,"ok",duckdb_create_logical_type(DUCKDB_TYPE_BOOLEAN));
     duckdb_bind_add_result_column(info,"mode",duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
@@ -2524,7 +2534,7 @@ static void mod_bind(duckdb_bind_info info) {
     duckdb_bind_add_result_column(info,"message",duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
     duckdb_bind_add_result_column(info,"detail",duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
     duckdb_bind_add_result_column(info,"sql_name",duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
-    duckdb_bind_set_bind_data(info,d,free);
+    duckdb_bind_set_bind_data(info,d,bind_free);
 }
 
 /* mod_init_locked: full logic (all modes). Caller holds LUA_LOCK. */
@@ -2955,6 +2965,48 @@ static void mod_init_locked(duckdb_init_info info) {
         /* Mirror into the per-database registry (both UDF and module-table
          * forms) so the lib survives restarts on this db file. */
         udf_registry_set(name, src);
+
+        /* Optional: also wrap luajit_table in a named TABLE MACRO (install-time
+         * "real name" sugar, e.g. table_macro := 'read_csv_dialect' →
+         * SELECT * FROM read_csv_dialect(src)). Mirrors quick_compile's
+         * auto-scalar-macro; uses the REAL registered name so the macro stays
+         * correct. Identifier-only guard (no quoting → no injection). */
+        if (isfn && d->table_macro && d->table_macro[0]) {
+            bool idok = true;
+            for (const char *c = d->table_macro; *c; c++) {
+                if (!isalnum((unsigned char)*c) && *c != '_') { idok = false; break; }
+            }
+            if (!isalnum((unsigned char)d->table_macro[0]) && d->table_macro[0] != '_') idok = false;
+            if (!idok) {
+                char b[1024];
+                snprintf(b, sizeof(b), "install '%s': table_macro name must be an identifier (letters/digits/_)", name);
+                d->msg = strdup(b);
+                free(src);
+                return;
+            }
+            char ddl[4096];
+            snprintf(ddl, sizeof(ddl),
+                "CREATE OR REPLACE MACRO %s(src) AS TABLE SELECT * FROM luajit_table('%s', list := src)",
+                d->table_macro, name);
+            if (g_conn) {
+                LUA_LOCK();
+                duckdb_result rres;
+                duckdb_state st = duckdb_query(g_conn, ddl, &rres);
+                if (st != DuckDBSuccess) {
+                    const char *err = duckdb_result_error(&rres);
+                    char b[1024];
+                    snprintf(b, sizeof(b), "install '%s': table_macro '%s' failed: %s",
+                             name, d->table_macro, err ? err : "unknown");
+                    d->msg = strdup(b);
+                    duckdb_destroy_result(&rres);
+                    LUA_UNLOCK();
+                    free(src);
+                    return;
+                }
+                duckdb_destroy_result(&rres);
+                LUA_UNLOCK();
+            }
+        }
         d->ok=true;d->phase="install";d->sql_name=strdup(name);
         /* Report the REAL cache path (HOME on POSIX, USERPROFILE on Windows)
          * instead of a hard-coded ~/ — the user may dofile() it. Forward
@@ -2967,8 +3019,13 @@ static void mod_init_locked(duckdb_init_info info) {
         snprintf(b,sizeof(b),"installed '%s' (%s) — cached at %s",name,
             isfn?"UDF":"module table",cache_path);
         d->msg=strdup(b);
-        if(isfn)
-            snprintf(b,sizeof(b),"luajit_table('%s') or luajit_s('%s', ...)",name,name);
+        if(isfn){
+            if(d->table_macro && d->table_macro[0])
+                snprintf(b,sizeof(b),"SELECT * FROM %s(<src>)  [table macro]  |  luajit_table('%s') / luajit_s('%s', ...)",
+                         d->table_macro, name, name);
+            else
+                snprintf(b,sizeof(b),"luajit_table('%s') or luajit_s('%s', ...)",name,name);
+        }
         else
             snprintf(b,sizeof(b),"module: reference global '%s' from other UDFs, or dofile the cached file",name);
         d->detail=strdup(b);
@@ -3284,6 +3341,7 @@ void luajit_register_module_functions(
     duckdb_table_function_add_named_parameter(t,"mode",duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
     duckdb_table_function_add_named_parameter(t,"source",duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
     duckdb_table_function_add_named_parameter(t,"sql_name",duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+    duckdb_table_function_add_named_parameter(t,"table_macro",duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
     duckdb_table_function_set_bind(t,mod_bind);
     duckdb_table_function_set_init(t,mod_init);
     duckdb_table_function_set_function(t,mod_func);
