@@ -1,0 +1,9 @@
+{
+  "name": "duckdb-luajit",
+  "version": "0.33.0",
+  "description": "Verified, source-checked SQL knowledge for the duckdb-luajit DuckDB extension. Five skills: expressions & UDFs, table functions & type bridges, remote Lua libraries, security levels, and China-domain data sources.",
+  "author": {
+    "name": "alitrack"
+  },
+  "homepage": "https://github.com/alitrack/duckdb-luajit"
+}

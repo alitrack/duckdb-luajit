@@ -1,0 +1,15 @@
+{
+  "name": "duckdb-luajit",
+  "owner": {
+    "name": "alitrack",
+    "url": "https://github.com/alitrack"
+  },
+  "plugins": [
+    {
+      "name": "duckdb-luajit",
+      "description": "Verified SQL knowledge for the duckdb-luajit extension: Lua expressions, JIT UDFs, table functions, and 50+ one-SQL-install libraries",
+      "source": "./duckdb-luajit",
+      "category": "data"
+    }
+  ]
+}
