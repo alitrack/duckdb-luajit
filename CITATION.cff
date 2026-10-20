@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this extension, please cite it as below."
+title: "duckdb-luajit: In-Process JIT-Compiled Lua UDFs for DuckDB"
+authors:
+  - family-names: "Li"
+    given-names: "Hongyan"
+repository-code: "https://github.com/alitrack/duckdb-luajit"
+url: "https://community-extensions.duckdb.org/extensions/luajit.html"
+abstract: >-
+  A DuckDB extension providing in-process JIT-compiled Lua UDFs via LuaJIT:
+  per-thread lua_State pools, a trusted sandbox, chunk-batched scalar and
+  aggregate functions (including GROUP BY), LIST/STRUCT/MAP nested-type
+  bridges, and an embedded Fennel compiler. Distributed as an official
+  DuckDB community extension.
+keywords:
+  - DuckDB
+  - LuaJIT
+  - UDF
+  - just-in-time compilation
+  - database extension
+license: MIT
+type: software
+version: 0.32.5
+date-released: "2026-09-28"
