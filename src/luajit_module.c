@@ -720,10 +720,11 @@ static void to_str(lua_State *L) {
  * lua_State — call from the same statement shape you are diagnosing. */
 
 static const char *LJ_JIT_INFO_SNIPPET =
-    "local n=0 local ju=require('jit.util') "
-    "for t=1,10000 do if ju.traceinfo(t) then n=n+1 else break end end "
+    "local n=-1 local ok,ju=pcall(require,'jit.util') "
+    "if ok and ju and ju.traceinfo then n=0 "
+    "for t=1,10000 do if ju.traceinfo(t) then n=n+1 else break end end end "
     "return string.format('{\\\"jit\\\":%s,\\\"traces\\\":%d}', "
-    "select(1,jit.status()) and 'true' or 'false', n)";
+    "type(jit)=='table' and select(1,jit.status()) and 'true' or 'false', n)";
 
 static void fj_jit_info(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
     LUA_BEGIN();
