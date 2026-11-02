@@ -11,6 +11,15 @@
 
 ## Next
 
+- [ ] **2.0-line migration: function metadata via C++ registration path** (issue #2,
+      upstream duckdb#27823). C API has no description/parameter-name setters for
+      scalar/aggregate functions even on `main` (verified 2026-11-02, 554 C API
+      entries grep'd). Decision point during the 2.0 port: switch registrations to
+      `CreateScalarFunctionInfo` + `FunctionDescription` (descriptions, examples,
+      real parameter names for all 17 registrations), or wait for the C API to grow
+      setters. Table functions already expose real names via
+      `duckdb_table_function_add_named_parameter` — no action needed there.
+      https://github.com/alitrack/duckdb-luajit/issues/2
 - [ ] Community-extensions listing (PR to duckdb/community-extensions)
 - [ ] Co-maintainers for the libs repo (see MAINTAINERS.md — areas wanted)
 - [ ] `benchmark/` dir + weekly CI benchmark (review P1-2)
