@@ -1,0 +1,30 @@
+# name: test/sql/luajit_jit_info.test
+# description: luajit_jit_info() JIT observability probe (trace counting)
+# group: [luajit]
+
+require luajit
+
+statement ok
+SELECT 1
+
+# shape: valid JSON with jit boolean; trace count is state-dependent so only
+# assert the prefix via regex-free substring checks
+
+query T
+SELECT luajit_jit_info() LIKE '{"jit":%'
+----
+true
+
+query T
+SELECT luajit_jit_info() LIKE '%,"traces":%}'
+----
+true
+
+# JIT is on by default in this build (trace count is state-dependent: the
+# test harness's own Lua loading may already have recorded traces, so only
+# assert the jit flag, not the count)
+
+query T
+SELECT luajit_jit_info() LIKE '{"jit":true,"traces":%'
+----
+true
