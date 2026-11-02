@@ -708,6 +708,45 @@ static void to_str(lua_State *L) {
 
 /* ── luajit(str) → VARCHAR ── */
 
+/* ── luajit_jit_info() → VARCHAR: JIT observability ──
+ * Evaluates a tiny Lua snippet on the calling thread's TLS lua_State:
+ *   local n=0; local ju=require("jit.util")
+ *   for t=1,10000 do if ju.traceinfo(t) then n=n+1 else break end end
+ *   local on=select(1,jit.status())
+ *   return ('{"jit":%s,"traces":%d}'):format(on and "true" or "false", n)
+ * traces>0 proves hot loops run as compiled traces; traces==0 means nothing
+ * got hot enough or NYI silent-abort (docs/performance-jit.md,
+ * duckdb-luajit-libs). Per-thread by design: each DuckDB worker owns its
+ * lua_State — call from the same statement shape you are diagnosing. */
+
+static const char *LJ_JIT_INFO_SNIPPET =
+    "local n=0 local ju=require('jit.util') "
+    "for t=1,10000 do if ju.traceinfo(t) then n=n+1 else break end end "
+    "return string.format('{\\\"jit\\\":%s,\\\"traces\\\":%d}', "
+    "select(1,jit.status()) and 'true' or 'false', n)";
+
+static void fj_jit_info(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
+    LUA_BEGIN();
+    idx_t n = duckdb_data_chunk_get_size(in);
+    for (idx_t r = 0; r < n; r++) {
+        const char *result;
+        if (luaL_loadbuffer(L, LJ_JIT_INFO_SNIPPET, strlen(LJ_JIT_INFO_SNIPPET), "jit_info") != LUA_OK ||
+            lua_pcall(L, 0, 1, 0) != LUA_OK) {
+            result = lua_tostring(L, -1);   /* error text — visible, not silent */
+            if (!result) result = "{\"jit\":false,\"error\":\"unknown\"}";
+            lua_pop(L, 1);
+        } else {
+            size_t len = 0;
+            result = lua_tolstring(L, -1, &len);
+            if (!result) { result = "{\"jit\":false,\"error\":\"non-string\"}"; }
+            lua_pop(L, 1);
+        }
+        duckdb_vector_assign_string_element(out, r, result);
+    }
+    LUA_CLEANUP();
+    (void)fi;
+}
+
 static void fj(duckdb_function_info fi, duckdb_data_chunk in, duckdb_vector out) {
     LUA_BEGIN();
     idx_t n=duckdb_data_chunk_get_size(in);
@@ -3240,6 +3279,16 @@ void luajit_register_module_functions(
     #define END() duckdb_register_scalar_function(conn,f);duckdb_destroy_scalar_function(&f);}while(0)
 
     REG("luajit",   fj,  DUCKDB_TYPE_VARCHAR) END();
+
+    /* luajit_jit_info(): zero-arg JIT observability probe (per-thread TLS
+     * state): {"jit":true,"traces":N}. See docs/performance-jit.md. */
+    { duckdb_scalar_function f = duckdb_create_scalar_function();
+      duckdb_scalar_function_set_name(f, "luajit_jit_info");
+      duckdb_scalar_function_set_function(f, fj_jit_info);
+      duckdb_scalar_function_set_return_type(f, duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR));
+      duckdb_register_scalar_function(conn, f);
+      duckdb_destroy_scalar_function(&f); }
+
     REG("luajit_i", fji, DUCKDB_TYPE_BIGINT)  VARGS(DUCKDB_TYPE_BIGINT)  END();
     REG("luajit_f", fjf, DUCKDB_TYPE_DOUBLE)  VARGS(DUCKDB_TYPE_DOUBLE)  END();
     REG("luajit_b", fjb, DUCKDB_TYPE_BOOLEAN) VARGS(DUCKDB_TYPE_BOOLEAN) END();
